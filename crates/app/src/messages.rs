@@ -13,6 +13,14 @@
 //!
 //! The UI thread makes one request of the input hook thread, through
 //! [`HookHandle`].
+//!
+//! Reasons shown to the user (`HookStatus::Unavailable` / `Degraded`,
+//! `RecorderEvent::Interrupted`, the errors of `Recorder::start` and `stop`)
+//! are complete sentences that end with a period. [`sentence`] is the one
+//! place that adds a missing final period: each producer passes its reason
+//! through it where the reason leaves its module. The UI shows reasons as they
+//! are and only appends whole sentences after them, so a message never ends in
+//! ".." or has a sentence wrapped in parentheses.
 
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
@@ -61,10 +69,13 @@ pub enum GestureEvent {
 pub enum HookStatus {
     /// Hooks installed and receiving events.
     Active,
-    /// Windows refused or removed the hooks; clicks are untouched. The reason is shown to the user.
+    /// Windows refused or removed the hooks; clicks are untouched. The reason
+    /// (a [`sentence`] saying why) is shown to the user.
     Unavailable(String),
-    /// Click replay failed (for example `SendInput` refused by UIPI). The hook stopped
-    /// holding clicks to fail open, and the gesture is disabled until re-enabled.
+    /// Click replay failed (for example `SendInput` refused by UIPI), or the hook
+    /// hit an internal error. The hook stopped holding clicks to fail open, and
+    /// the gesture is disabled until re-enabled. The reason is a [`sentence`]
+    /// saying what went wrong; the UI adds what TedCat did about it.
     Degraded(String),
     /// The emergency switch (Esc pressed 3 times within 1.5 s) turned the gesture off.
     KillSwitch,
@@ -95,9 +106,24 @@ pub struct RecordingResult {
 pub enum RecorderEvent {
     /// Capture stopped on its own (display removed, device lost, writer failure).
     /// The UI must call `Recorder::stop` to finalize whatever was captured.
+    /// The reason is a [`sentence`].
     Interrupted(String),
     /// The recording was finalized (posted by the worker thread that ran `stop`).
     Finished(Result<RecordingResult, String>),
+}
+
+/// `text` as a sentence for the user: trimmed, the first letter capitalized
+/// and a final period added unless it already ends with `.`, `!`, `?` or `…`.
+/// Idempotent, so passing a reason through it twice changes nothing.
+pub fn sentence(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else { return String::new() };
+    let mut out: String = first.to_uppercase().chain(chars).collect();
+    if !out.ends_with(['.', '!', '?', '\u{2026}']) {
+        out.push('.');
+    }
+    out
 }
 
 /// The per-process cookie that [`UiHandle::post`] puts in `WPARAM`. Random
@@ -229,6 +255,25 @@ mod tests {
         // SAFETY: built exactly like `UiHandle::post` builds a message.
         let taken = unsafe { take_payload::<GestureEvent>(WPARAM(payload_cookie()), LPARAM(raw as isize)) };
         assert_eq!(taken.as_deref(), Some(&GestureEvent::Cancel));
+    }
+
+    #[test]
+    fn sentences_get_exactly_one_final_period() {
+        assert_eq!(sentence("The audio output device was disconnected."), "The audio output device was disconnected.");
+        assert_eq!(sentence("The display resolution changed"), "The display resolution changed.");
+        assert_eq!(sentence("  could not write the Run key (error 5) "), "Could not write the Run key (error 5).");
+        assert_eq!(
+            sentence("Screen capture stopped: The device was removed. (0x887A0005)"),
+            "Screen capture stopped: The device was removed. (0x887A0005)."
+        );
+        assert_eq!(sentence("Really?"), "Really?");
+        assert_eq!(sentence("\u{e9}t\u{e9}"), "\u{c9}t\u{e9}.");
+        assert_eq!(sentence(""), "");
+        assert_eq!(sentence("   "), "");
+        for text in ["x", "Nothing was recorded.", "A (b)", "c\u{2026}"] {
+            assert_eq!(sentence(&sentence(text)), sentence(text), "{text}");
+            assert!(!sentence(text).ends_with(".."), "{text}");
+        }
     }
 
     #[test]

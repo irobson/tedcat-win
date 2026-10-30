@@ -11,9 +11,14 @@
 //! `Effect` that concerns the UI to `ui` as `WM_APP_GESTURE` / `GestureEvent`.
 //!
 //! Required behaviour:
-//! - Left button only. Right/middle buttons, wheel and plain moves are never
-//!   swallowed (swallowing `WM_MOUSEMOVE` freezes the cursor). While pending,
-//!   moves within tolerance pass through but are still fed to the recognizer.
+//! - Left button only. Moves are never swallowed (swallowing `WM_MOUSEMOVE`
+//!   freezes the cursor); while pending, moves within tolerance pass through
+//!   but are still fed to the recognizer. Right/middle/X buttons, wheels and
+//!   other keys pass through too, except while something is waiting (a
+//!   modifier held behind the pending press, or a queued replay): then they
+//!   are queued behind it, and modifiers held behind a pending press end the
+//!   hold first, so nothing overtakes what physically came first (see
+//!   `logic`, "Stream order").
 //! - Hold: swallow the left-down and remember it. Release: re-inject the held
 //!   down and then the current event with one `SendInput` call (absolute,
 //!   virtual-desk coordinates, `dwExtraInfo = TEDCAT_INPUT_MARKER`), from the
@@ -94,11 +99,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, LASTINPUTINFO, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
-    VK_SHIFT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN,
+    VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
@@ -112,13 +117,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use self::logic::{
-    class_has_prefix, hooks_look_dead, is_modifier_vk, is_pen_or_touch, may_hold_over, may_queue_keys_for,
-    modifiers_from_keys, normalize_absolute, Command, HookLogic, IntegrityCache, KeyStroke, LogLevel, PressContext,
-    Replay, ReplayAction, ReplayEvent, Throttled, UpdateThrottle,
+    class_has_prefix, hooks_look_dead, is_modifier_vk, is_pen_or_touch, key_releases_to_retry, may_hold_over,
+    may_queue_keys_for, modifiers_from_keys, normalize_absolute, Command, HookLogic, IntegrityCache, KeyStroke,
+    LogLevel, PressContext, Replay, ReplayAction, ReplayEvent, Throttled, UpdateThrottle,
 };
 use crate::geom::{MonitorInfo, PointPx};
 use crate::messages::{
-    unpack_point, GestureEvent, HookHandle, HookStatus, UiHandle, WM_APP_GESTURE, WM_APP_HOOK_STATUS,
+    sentence, unpack_point, GestureEvent, HookHandle, HookStatus, UiHandle, WM_APP_GESTURE, WM_APP_HOOK_STATUS,
     WM_HOOK_SELECTION_REFUSED,
 };
 use crate::util::win::CLASS_PREFIX;
@@ -188,7 +193,7 @@ impl InputHook {
             Ok(thread_id) => Ok(InputHook { thread_id, thread: Some(thread) }),
             Err(_) => {
                 let _ = thread.join();
-                Err(std::io::Error::other("the input hook thread exited during start-up"))
+                Err(std::io::Error::other("The input hook thread exited during start-up."))
             }
         }
     }
@@ -481,6 +486,7 @@ impl HookThread {
     }
 
     fn report_unavailable(&mut self, reason: String) {
+        let reason = sentence(&reason);
         self.log.write(LogLevel::Error, format!("Input hooks unavailable: {reason}"));
         self.reported_unavailable = true;
         self.post_status(HookStatus::Unavailable(reason));
@@ -511,24 +517,24 @@ impl HookThread {
         swallow
     }
 
-    /// A keyboard hook event: Escape (cancel, emergency switch) and the
-    /// modifier keys (kept in order with a held press). Returns true to swallow it.
+    /// A keyboard hook event: Escape (cancel, emergency switch), the modifier
+    /// keys (kept in order with a held press) and every other key (kept in
+    /// order with whatever is waiting). Returns true to swallow it.
     fn key_event(&mut self, message: u32, info: &KBDLLHOOKSTRUCT) -> bool {
-        let escape = info.vkCode == u32::from(VK_ESCAPE.0);
-        if info.dwExtraInfo == TEDCAT_INPUT_MARKER || !(escape || is_modifier_vk(info.vkCode)) {
+        if info.dwExtraInfo == TEDCAT_INPUT_MARKER {
             return false;
         }
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if !down && !matches!(message, WM_KEYUP | WM_SYSKEYUP) {
             return false;
         }
-        let swallow = if escape {
+        let swallow = if info.vkCode == u32::from(VK_ESCAPE.0) {
             // SAFETY: GetTickCount has no preconditions.
             let now = unsafe { GetTickCount() };
             self.logic.escape(down, now)
         } else {
             let key = KeyStroke {
-                // Virtual keys and scan codes fit in 16 bits.
+                // Virtual keys and scan codes (or a VK_PACKET's UTF-16 unit) fit in 16 bits.
                 vk: info.vkCode as u16,
                 scan: info.scanCode as u16,
                 extended: info.flags.0 & LLKHF_EXTENDED.0 != 0,
@@ -536,7 +542,12 @@ impl HookThread {
             };
             let probe = &mut self.probe;
             let now_ms = self.clock.elapsed().as_millis() as u64;
-            self.logic.modifier_key(key, || probe.foreground_accepts_keys(now_ms))
+            let accepts = || probe.foreground_accepts_keys(now_ms);
+            if is_modifier_vk(info.vkCode) {
+                self.logic.modifier_key(key, accepts)
+            } else {
+                self.logic.other_key(key, accepts)
+            }
         };
         self.run_commands();
         swallow
@@ -738,9 +749,10 @@ impl HookThread {
     /// call, so they keep their order.
     ///
     /// If Windows inserts fewer events than requested, the key releases that
-    /// did not get in are tried once more on their own (a lost key-up leaves a
-    /// modifier stuck down), and if a mouse event did not get in the hook
-    /// fails open. Keys alone (a mask key, modifiers released after a click)
+    /// did not get in, the menu mask key's included, are tried once more on
+    /// their own (a lost key-up leaves that key logically down, see
+    /// `key_releases_to_retry`), and if a mouse event did not get in the hook
+    /// fails open. Keys alone (a mask key, keys released after a click)
     /// failing is only logged: click holding does not depend on them.
     fn send_replays(&mut self) {
         let replays = self.logic.take_replays();
@@ -761,11 +773,8 @@ impl HookThread {
         let error = unsafe { GetLastError() };
         let reason = format!("SendInput inserted {inserted} of {} events, error {}", inputs.len(), error.0);
         let missed = &replays[inserted..];
-        let key_ups: Vec<INPUT> = missed
-            .iter()
-            .filter(|replay| matches!(replay, Replay::Key(key) if key.up && !key.is_mask()))
-            .map(|replay| replay_input(replay, &screen, swapped))
-            .collect();
+        let key_ups: Vec<INPUT> =
+            key_releases_to_retry(missed).iter().map(|replay| replay_input(replay, &screen, swapped)).collect();
         if !key_ups.is_empty() {
             // SAFETY: as above.
             let again = unsafe { SendInput(&key_ups, std::mem::size_of::<INPUT>() as i32) } as usize;
@@ -1045,7 +1054,8 @@ fn replay_input(replay: &Replay, screen: &VirtualScreen, swapped: bool) -> INPUT
 }
 
 /// One marked keyboard event: the virtual key and scan code as the hook saw
-/// them, extended when the original was.
+/// them, extended when the original was. A `VK_PACKET` character goes out as
+/// the Unicode event it came from (no virtual key, the character in `wScan`).
 fn key_input(key: &KeyStroke) -> INPUT {
     let mut flags = KEYBD_EVENT_FLAGS(0);
     if key.up {
@@ -1054,11 +1064,14 @@ fn key_input(key: &KeyStroke) -> INPUT {
     if key.extended {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
+    if key.is_unicode() {
+        flags |= KEYEVENTF_UNICODE;
+    }
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(key.vk),
+                wVk: VIRTUAL_KEY(if key.is_unicode() { 0 } else { key.vk }),
                 wScan: key.scan,
                 dwFlags: flags,
                 time: 0,
@@ -1225,5 +1238,17 @@ mod tests {
         assert_eq!(mask.wVk, VIRTUAL_KEY(0xE8));
         assert_eq!(mask.dwFlags, KEYBD_EVENT_FLAGS(0));
         assert_eq!(mask.dwExtraInfo, TEDCAT_INPUT_MARKER);
+    }
+
+    #[test]
+    fn unicode_characters_are_replayed_as_unicode_events() {
+        // "é" injected with KEYEVENTF_UNICODE: the hook reports VK_PACKET with the character as scan code.
+        let released = KeyStroke { vk: 0xE7, scan: 0x00E9, extended: false, up: true };
+        // SAFETY: the union was initialized as `ki`.
+        let ki = unsafe { key_input(&released).Anonymous.ki };
+        assert_eq!(ki.wVk, VIRTUAL_KEY(0));
+        assert_eq!(ki.wScan, 0x00E9);
+        assert_eq!(ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        assert_eq!(ki.dwExtraInfo, TEDCAT_INPUT_MARKER);
     }
 }

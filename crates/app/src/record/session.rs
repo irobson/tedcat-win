@@ -16,7 +16,7 @@ use super::timing;
 use super::video::{VideoCapture, VideoOutcome};
 use super::writer::{copy_buffer, VideoFormat, Writer, AUDIO_RATE};
 use super::{RecorderOptions, Target};
-use crate::messages::{RecorderEvent, RecordingResult, UiHandle, WM_APP_RECORDER};
+use crate::messages::{sentence, RecorderEvent, RecordingResult, UiHandle, WM_APP_RECORDER};
 use crate::{log_error, log_info, log_warn};
 
 /// How long an audio-only start waits for the first packet before going on anyway.
@@ -79,14 +79,16 @@ impl Shared {
     }
 
     /// Tells the UI, once, that capture stopped on its own. The UI then calls
-    /// `Recorder::stop`, which still finalizes what was captured.
+    /// `Recorder::stop`, which still finalizes what was captured. `reason`
+    /// becomes a sentence for the user.
     pub(super) fn interrupt(&self, reason: &str) {
+        let reason = sentence(reason);
         if self.quiet.swap(true, Ordering::AcqRel) {
             log_warn!("recorder: {reason}");
             return;
         }
         log_error!("recording interrupted: {reason}");
-        if !self.events.post(WM_APP_RECORDER, RecorderEvent::Interrupted(reason.to_string())) {
+        if !self.events.post(WM_APP_RECORDER, RecorderEvent::Interrupted(reason)) {
             log_warn!("could not notify the UI that the recording was interrupted");
         }
     }

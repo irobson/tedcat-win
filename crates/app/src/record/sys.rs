@@ -146,3 +146,13 @@ pub(super) fn delete_output(path: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_windows_n_message_is_a_sentence() {
+        assert_eq!(crate::messages::sentence(MEDIA_FOUNDATION_MISSING), MEDIA_FOUNDATION_MISSING);
+    }
+}

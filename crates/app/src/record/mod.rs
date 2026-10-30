@@ -35,6 +35,11 @@
 //! If there is no audio output device: region recordings continue without
 //! audio (`has_audio = false`); audio-only recordings fail with a clear message.
 //!
+//! Messages: every reason this module hands the UI (the errors of `start`
+//! and `stop`, `RecorderEvent::Interrupted`) goes through
+//! `messages::sentence` on the way out, so it is a complete sentence with
+//! one final period; the UI adds none.
+//!
 //! Robustness: if capture or writing fails mid-recording, post
 //! `RecorderEvent::Interrupted(reason)` to `events` once; `stop` must still
 //! finalize what was captured. Never leave an empty or unplayable file: delete
@@ -57,7 +62,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::geom::{MonitorInfo, RectPx};
-use crate::messages::{RecordingResult, UiHandle};
+use crate::messages::{sentence, RecordingResult, UiHandle};
 use crate::{log_error, log_warn};
 use session::Command;
 
@@ -94,18 +99,19 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Starts capturing. Returns once frames/audio are flowing or start failed.
+    /// Starts capturing. Returns once frames/audio are flowing or start failed
+    /// (the error is a sentence for the user).
     pub fn start(target: Target, options: RecorderOptions, events: UiHandle) -> Result<Recorder, String> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (commands, command_rx) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("TedCat recorder".into())
             .spawn(move || session::run(target, options, events, ready_tx, command_rx))
-            .map_err(|e| format!("Could not start the recorder: {e}"))?;
+            .map_err(|e| sentence(&format!("Could not start the recorder: {e}")))?;
         match ready_rx.recv_timeout(START_TIMEOUT) {
             Ok(Ok(())) => Ok(Recorder { commands, worker }),
             // The thread is already cleaning up and exits on its own.
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => Err(sentence(&e)),
             Err(RecvTimeoutError::Timeout) => {
                 log_error!("recording did not start within {START_TIMEOUT:?}");
                 let _ = commands.send(Command::Abort);
@@ -118,11 +124,12 @@ impl Recorder {
         }
     }
 
-    /// Stops capturing and finalizes the file. Blocking; call it off the UI thread.
+    /// Stops capturing and finalizes the file. Blocking; call it off the UI
+    /// thread. The error is a sentence for the user.
     pub fn stop(self) -> Result<RecordingResult, String> {
         let _ = self.commands.send(Command::Stop);
         match self.worker.join() {
-            Ok(result) => result,
+            Ok(result) => result.map_err(|e| sentence(&e)),
             Err(_) => {
                 log_warn!("the recorder thread panicked");
                 Err("The recorder stopped unexpectedly.".into())

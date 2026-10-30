@@ -1,4 +1,5 @@
-//! Opening files and folders with the shell.
+//! Opening files and folders with the shell. Errors are sentences for the
+//! user (`messages::sentence`).
 
 use std::path::Path;
 
@@ -15,7 +16,7 @@ pub(crate) fn open(path: &Path) -> Result<(), String> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!("Windows could not open {} (error {})", path.display(), result.0 as isize))
+        Err(format!("Windows could not open {} (error {}).", path.display(), result.0 as isize))
     }
 }
 
@@ -41,7 +42,7 @@ pub(crate) fn reveal(path: &Path) -> Result<(), String> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!("Windows could not show {} in Explorer", path.display()))
+        Err(format!("Windows could not show {} in Explorer.", path.display()))
     }
 }
 
@@ -58,6 +59,6 @@ pub(crate) fn open_text(path: &Path) -> Result<(), String> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!("Windows could not open {}", path.display()))
+        Err(format!("Windows could not open {}.", path.display()))
     }
 }

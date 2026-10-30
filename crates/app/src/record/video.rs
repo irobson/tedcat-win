@@ -65,9 +65,9 @@ use crate::{log_info, log_warn};
 /// How long `start` waits for the first captured frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Why a recording stops when the monitor's size changes under it. No final
-/// period: the UI appends its own sentence.
-const DISPLAY_CHANGED: &str = "The display resolution changed during the recording";
+/// Why a recording stops when the monitor's size changes under it: a
+/// sentence (see `messages::sentence`); the UI appends its own after it.
+const DISPLAY_CHANGED: &str = "The display resolution changed during the recording.";
 
 /// Opaque black, for the parts of the region outside the captured content.
 const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -263,7 +263,7 @@ impl VideoCapture {
             }
         }
         let on_closed = TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
-            shared.interrupt("The display being recorded was disconnected");
+            shared.interrupt("The display being recorded was disconnected.");
             Ok(())
         });
         match capture.item.Closed(&on_closed) {
@@ -798,4 +798,14 @@ fn create_texture(
     // SAFETY: `desc` describes a valid texture; no initial data.
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
     texture.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_display_change_reason_is_a_sentence() {
+        assert_eq!(crate::messages::sentence(DISPLAY_CHANGED), DISPLAY_CHANGED);
+    }
 }

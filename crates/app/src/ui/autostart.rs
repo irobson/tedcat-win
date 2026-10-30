@@ -85,8 +85,13 @@ fn check(status: WIN32_ERROR, what: &str) -> Result<(), String> {
     }
 }
 
-/// Turns launching at login on (for this TedCat.exe) or off.
+/// Turns launching at login on (for this TedCat.exe) or off. The error is a
+/// sentence for the user (`messages::sentence`).
 pub(crate) fn set_enabled(enabled: bool) -> Result<(), String> {
+    write_run_key(enabled).map_err(|error| crate::messages::sentence(&error))
+}
+
+fn write_run_key(enabled: bool) -> Result<(), String> {
     if enabled {
         let command = crate::util::wide(&run_command(&current_exe()?));
         // SAFETY: the data pointer and byte length describe `command`, including its null.

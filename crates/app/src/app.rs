@@ -68,8 +68,8 @@ use crate::capture::screenshot;
 use crate::geom::{MonitorInfo, PointPx, RectPx};
 use crate::input::{GestureSettings, InputHook, SelectionOverlay};
 use crate::messages::{
-    take_payload, GestureEvent, HookHandle, HookStatus, RecorderEvent, RecordingResult, UiHandle, WM_APP_GESTURE,
-    WM_APP_HOOK_STATUS, WM_APP_RECORDER, WM_APP_TRAY,
+    sentence, take_payload, GestureEvent, HookHandle, HookStatus, RecorderEvent, RecordingResult, UiHandle,
+    WM_APP_GESTURE, WM_APP_HOOK_STATUS, WM_APP_RECORDER, WM_APP_TRAY,
 };
 use crate::record::{Recorder, RecorderOptions, Target};
 use crate::settings::Settings;
@@ -106,6 +106,54 @@ const FOREIGN_LOG_LIMIT: u32 = 10;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 const STOPPED_TITLE: &str = "TedCat stopped intercepting clicks";
+
+/// The balloon for a hook status: title, text and kind (`None` for `Active`).
+/// The reasons are sentences (`messages::sentence`); the text appends whole
+/// sentences after them.
+fn hook_status_notice(status: &HookStatus) -> Option<(&'static str, String, Balloon)> {
+    match status {
+        HookStatus::Active => None,
+        HookStatus::Unavailable(reason) => Some((
+            STOPPED_TITLE,
+            format!(
+                "Windows did not let TedCat watch the mouse, so clicks are left alone. {reason} \
+                 To try again, choose Enabled in the TedCat menu."
+            ),
+            Balloon::Warning,
+        )),
+        HookStatus::Degraded(reason) => Some((
+            STOPPED_TITLE,
+            format!(
+                "{reason} TedCat let go of the mouse to keep clicks working. \
+                 To turn it back on, choose Enabled in the TedCat menu."
+            ),
+            Balloon::Warning,
+        )),
+        HookStatus::KillSwitch => Some((
+            "TedCat is paused",
+            "Escape was pressed 3 times, so TedCat stopped intercepting clicks. \
+             To turn it back on, choose Enabled in the TedCat menu."
+                .to_owned(),
+            Balloon::Info,
+        )),
+    }
+}
+
+/// The balloon text when a recording stops on its own. `reason` is a sentence.
+fn interrupted_notice(reason: &str) -> String {
+    format!("{reason} TedCat saves what was captured.")
+}
+
+/// A Windows error as a sentence for the user: its message, or its code when
+/// Windows has no text for it.
+fn error_sentence(error: &windows::core::Error) -> String {
+    let message = error.message();
+    if message.trim().is_empty() {
+        format!("Windows error 0x{:08X}.", error.code().0 as u32)
+    } else {
+        sentence(&message)
+    }
+}
 
 /// Runs TedCat until the user quits. Returns the process exit code.
 pub fn run() -> i32 {
@@ -387,6 +435,9 @@ thread_local! {
     static UI: Cell<Option<UiHandle>> = const { Cell::new(None) };
     /// The running input hook, for requests made outside the controller.
     static HOOK_REQUESTS: Cell<Option<HookHandle>> = const { Cell::new(None) };
+    /// The gesture settings the hook reads (the controller's), so the end of
+    /// the session can stop holding presses even while the controller is borrowed.
+    static GESTURE: RefCell<Option<Arc<GestureSettings>>> = const { RefCell::new(None) };
     /// The running recorder. Outside the controller, so the end of the session
     /// can always finalize it, even while the controller is borrowed.
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
@@ -459,6 +510,20 @@ fn handle_orphan(message: AppMsg) {
         }
         _ => {}
     }
+}
+
+/// The session is ending while the controller is out of reach: nothing will
+/// handle gestures any more, so a press held now would be swallowed. Tells the
+/// hook to stop holding presses, as `Controller::shutdown` does; a press
+/// already pending is handed back when its hold timer fires. Only the flag the
+/// hook reads changes, never the saved setting, so the gesture is on again at
+/// the next start.
+fn stop_holding_presses() {
+    GESTURE.with(|gesture| {
+        if let Some(gesture) = gesture.borrow().as_ref() {
+            gesture.enabled.store(false, Ordering::SeqCst);
+        }
+    });
 }
 
 /// Asks the input hook to hand back the press of the selection that began at
@@ -738,8 +803,10 @@ fn end_session(main: HWND) {
         // Finalizes the recording and waits for every save itself.
         Some(controller) => controller.shutdown(),
         // A quit already in progress (it owns the controller), or a controller
-        // borrowed further up the stack: finalize from here.
+        // borrowed further up the stack: finalize from here. Presses pass
+        // straight through while this waits (the quit already did this).
         None => {
+            stop_holding_presses();
             block_shutdown(main);
             match begin_save(None) {
                 SaveStart::Started => crate::log_info!("finalizing the recording before the session ends"),
@@ -872,6 +939,7 @@ impl Controller {
         let settings = Settings::load();
         crate::log_info!("settings: {settings:?}");
         let gesture = GestureSettings::new(settings.enabled, settings.hold_millis, settings.trigger.modifiers());
+        GESTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&gesture)));
         let mut controller = Controller {
             main,
             msg_window,
@@ -898,7 +966,7 @@ impl Controller {
             }
             Err(error) => {
                 crate::log_error!("input hook could not start: {error}");
-                controller.on_hook_status(HookStatus::Unavailable(error.to_string()));
+                controller.on_hook_status(HookStatus::Unavailable(sentence(&error.to_string())));
             }
         }
         if first_run {
@@ -1069,7 +1137,7 @@ impl Controller {
                     overlay.close();
                 }
                 crate::log_error!("screenshot failed: {error}");
-                self.notice("Screenshot failed", &error.message(), Balloon::Error);
+                self.notice("Screenshot failed", &error_sentence(&error), Balloon::Error);
             }
         }
     }
@@ -1101,8 +1169,9 @@ impl Controller {
     /// A free file name in the recordings folder (created if missing).
     fn output_path(&self, extension: &str) -> Result<PathBuf, String> {
         let folder = self.settings.recordings_dir();
-        std::fs::create_dir_all(&folder)
-            .map_err(|error| format!("Could not create the recordings folder {}: {error}", folder.display()))?;
+        std::fs::create_dir_all(&folder).map_err(|error| {
+            sentence(&format!("Could not create the recordings folder {}: {error}", folder.display()))
+        })?;
         let stamp = paths::local_time();
         let name = text::unique_name(
             |attempt| recording_file_name(stamp, extension, attempt),
@@ -1190,11 +1259,7 @@ impl Controller {
             RecorderEvent::Interrupted(reason) => {
                 crate::log_warn!("recording interrupted: {reason}");
                 if matches!(self.recording, Recording::Running { .. }) {
-                    self.notice(
-                        "Recording stopped",
-                        &format!("{reason}. TedCat saves what was captured."),
-                        Balloon::Warning,
-                    );
+                    self.notice("Recording stopped", &interrupted_notice(&reason), Balloon::Warning);
                     self.stop_recording();
                 }
             }
@@ -1301,31 +1366,11 @@ impl Controller {
                 overlay.close();
             }
         }
-        match &status {
-            HookStatus::Active => {}
-            HookStatus::Unavailable(reason) if changed => self.notice(
-                STOPPED_TITLE,
-                &format!(
-                    "Windows did not let TedCat watch the mouse ({reason}), so clicks are left alone. \
-                     To try again, choose Enabled in the TedCat menu."
-                ),
-                Balloon::Warning,
-            ),
-            HookStatus::Degraded(reason) if changed => self.notice(
-                STOPPED_TITLE,
-                &format!(
-                    "Replaying a click failed ({reason}), so TedCat let go of the mouse to keep clicks working. \
-                     To turn it back on, choose Enabled in the TedCat menu."
-                ),
-                Balloon::Warning,
-            ),
-            HookStatus::KillSwitch => self.notice(
-                "TedCat is paused",
-                "Escape was pressed 3 times, so TedCat stopped intercepting clicks. \
-                 To turn it back on, choose Enabled in the TedCat menu.",
-                Balloon::Info,
-            ),
-            _ => {}
+        // Unavailable and Degraded are told once until the hook recovers; the
+        // emergency switch every time, since the user just pressed it.
+        let tell = changed || matches!(status, HookStatus::KillSwitch);
+        if let Some((title, text, kind)) = hook_status_notice(&status).filter(|_| tell) {
+            self.notice(title, &text, kind);
         }
         self.hook_status = status;
     }
@@ -1345,7 +1390,7 @@ impl Controller {
                 crate::log_error!("input hook could not restart: {error}");
                 // Make sure the user hears about it again: they asked for this.
                 self.hook_status = HookStatus::Active;
-                self.on_hook_status(HookStatus::Unavailable(error.to_string()));
+                self.on_hook_status(HookStatus::Unavailable(sentence(&error.to_string())));
             }
         }
     }
@@ -1467,15 +1512,21 @@ impl Controller {
     fn shutdown(mut self) {
         // First, stop holding presses: from here on nothing handles gestures, so
         // a press held during the wait below would be swallowed. A press that is
-        // already pending is handed back when its hold timer fires.
+        // already pending is handed back when its hold timer fires. Not saved:
+        // the gesture is on again at the next start.
         self.gesture.enabled.store(false, Ordering::SeqCst);
         crate::log_info!("TedCat is quitting; presses are no longer held");
         // SAFETY: our own timer on our own window.
         unsafe {
             let _ = KillTimer(Some(self.main), TRAY_RETRY_TIMER);
         }
+        // A selection in progress will never be committed: close its overlay
+        // and hand the held press back to the app, as when the overlay could
+        // not be shown. The hook gets the request before the stop below.
         if let Some(overlay) = self.overlay.take() {
+            let origin = overlay.origin();
             overlay.close();
+            refuse_selection(origin);
         }
         if matches!(self.recording, Recording::Running { .. }) {
             if let Some(hud) = &self.hud {
@@ -1628,5 +1679,72 @@ mod tests {
         assert!(matches!(begin_save(None), SaveStart::Nothing));
         assert!(!saves_pending());
         assert!(wait_for_saves(Duration::ZERO));
+    }
+
+    #[test]
+    fn the_end_of_the_session_stops_holding_presses_while_the_controller_is_out_of_reach() {
+        // No controller on this thread: the branch taken while a quit owns it
+        // or a handler further up the stack borrows it.
+        assert!(CONTROLLER.with(|slot| slot.borrow().is_none()));
+        let gesture = GestureSettings::new(true, 350, tedcat_core::Modifiers::NONE);
+        GESTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&gesture)));
+        let settings_before = std::fs::metadata(Settings::path()).and_then(|m| m.modified()).ok();
+        end_session(HWND::default());
+        assert!(!gesture.enabled.load(Ordering::SeqCst), "presses must pass straight through while TedCat ends");
+        let settings_after = std::fs::metadata(Settings::path()).and_then(|m| m.modified()).ok();
+        assert_eq!(settings_before, settings_after, "the switch-off is never saved");
+        let mut message = MSG::default();
+        // SAFETY: reads this thread's own queue: end_session ends its message loop.
+        let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool();
+        assert!(quit && message.message == WM_QUIT);
+        GESTURE.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn notices_append_whole_sentences_to_the_reasons() {
+        let reasons = [
+            sentence("The audio output device was disconnected."),
+            sentence("The display resolution changed during the recording"),
+            sentence("Screen capture stopped: The device was removed. (0x887A0005)"),
+        ];
+        assert_eq!(
+            interrupted_notice(&reasons[0]),
+            "The audio output device was disconnected. TedCat saves what was captured."
+        );
+        let statuses = [
+            HookStatus::Unavailable(sentence("Windows refused the mouse hook: Access is denied.")),
+            HookStatus::Degraded(sentence(
+                "Windows refused to replay a click (SendInput inserted 1 of 2 events, error 5)",
+            )),
+            HookStatus::KillSwitch,
+        ];
+        let mut texts: Vec<String> = reasons.iter().map(|reason| interrupted_notice(reason)).collect();
+        for status in &statuses {
+            let (title, text, _) = hook_status_notice(status).expect("every non-active status is told");
+            assert!(!title.ends_with('.'), "{title}");
+            texts.push(text);
+        }
+        assert_eq!(
+            texts[4],
+            "Windows refused to replay a click (SendInput inserted 1 of 2 events, error 5). TedCat let go of the \
+             mouse to keep clicks working. To turn it back on, choose Enabled in the TedCat menu."
+        );
+        for text in &texts {
+            assert!(text.ends_with('.') && !text.contains(".."), "{text}");
+            assert!(!text.contains(".)") && !text.contains(". ."), "{text}");
+            // A balloon holds 255 characters.
+            assert!(text.chars().count() <= 255, "{text}");
+        }
+        assert_eq!(hook_status_notice(&HookStatus::Active), None);
+    }
+
+    #[test]
+    fn windows_errors_read_as_sentences() {
+        let described =
+            windows::core::Error::new(windows::Win32::Foundation::E_FAIL, "The screenshot region is empty.");
+        assert_eq!(error_sentence(&described), "The screenshot region is empty.");
+        let bare = windows::core::Error::new(windows::core::HRESULT(0x8899_0001_u32 as i32), "");
+        let text = error_sentence(&bare);
+        assert!(text.ends_with('.') && !text.contains(".."), "{text}");
     }
 }

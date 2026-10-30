@@ -20,11 +20,19 @@ fn main() {
         // raw-dylib, which rustc turns into an ordinary import library) into
         // delay-load imports; delayimp.lib provides the helper. The GNU
         // toolchain has no delay loading, and only MSVC builds are released.
+        //
+        // Cargo applies `-bins` link arguments to the bin's unit-test harness
+        // as well (a build script cannot tell the two links apart), and no
+        // test calls into Media Foundation, so link.exe would warn there that
+        // the /DELAYLOAD is unused (LNK4199). That warning is silenced; the
+        // smoke test reads the release TedCat.exe's import table to prove
+        // both DLLs really are delay-loaded (step recording-delay-load).
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             for dll in DELAY_LOADED {
                 println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
             }
             println!("cargo:rustc-link-arg-bins=delayimp.lib");
+            println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
         }
     }
 }

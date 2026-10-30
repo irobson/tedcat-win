@@ -193,6 +193,12 @@ impl SelectionOverlay {
         self.mode
     }
 
+    /// The press point the selection began at (the `GestureEvent::Begin`
+    /// origin), which identifies the selection to the hook.
+    pub fn origin(&self) -> PointPx {
+        self.origin
+    }
+
     /// The monitor the overlay covers. Selections are clamped to it.
     pub fn monitor(&self) -> MonitorInfo {
         self.monitor

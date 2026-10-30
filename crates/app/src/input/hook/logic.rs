@@ -16,13 +16,25 @@
 //! is down; otherwise the app would see a lone Alt or Win tap (menu bar,
 //! KeyTips, Start menu) or a lone Shift tap (IME input mode).
 //!
+//! Stream order: once anything is waiting (a modifier held behind the press,
+//! or a replay in the queue), no later event may overtake it. So any other key
+//! (not Escape), wheel or other button that arrives then is queued too, and
+//! when modifiers wait behind a pending press it also ends the hold first: the
+//! press and its modifiers are queued (as when the pointer moves past the
+//! tolerance) and the event goes right behind them. Holding them all back
+//! instead would delay typing until the hold resolved and, if it became a
+//! selection, deliver those events to the overlay; ending the hold never eats
+//! input and keeps the physical order. Moves are never queued (every replay
+//! carries its own position) and Escape keeps its own handling (cancel, the
+//! emergency switch), so it always takes effect at once.
+//!
 //! Every method that can be reached from a hook callback is allocation-light
 //! and never blocks.
 
 use tedcat_core::{Effect, GestureConfig, HoldGestureRecognizer, Modifiers, Point, PointerInput, State, Verdict};
 
 use crate::geom::{PointPx, RectPx};
-use crate::messages::{GestureEvent, HookStatus};
+use crate::messages::{sentence, GestureEvent, HookStatus};
 
 /// Escape presses that trigger the emergency switch...
 pub(super) const KILL_SWITCH_PRESSES: usize = 3;
@@ -100,6 +112,25 @@ impl KeyStroke {
     pub const fn is_mask(&self) -> bool {
         self.vk == MENU_MASK_VK
     }
+
+    /// True for a `VK_PACKET` event (text injected with `KEYEVENTF_UNICODE`,
+    /// e.g. by an on-screen keyboard): `scan` then holds the UTF-16 unit, and
+    /// the replay must be a Unicode event again.
+    pub const fn is_unicode(&self) -> bool {
+        self.vk == VK_PACKET
+    }
+}
+
+/// `VK_PACKET`: the virtual key of characters injected with `KEYEVENTF_UNICODE`.
+const VK_PACKET: u16 = 0xE7;
+
+/// The key releases among `missed` (the tail of a batch `SendInput` did not
+/// insert), the user's and the menu mask key's alike: they are tried once
+/// more on their own, because a lost key-up leaves that key logically down
+/// (the mask key too, since it is a key like any other to Windows). Presses
+/// are not retried: a late key-down would be a new keystroke.
+pub(super) fn key_releases_to_retry(missed: &[Replay]) -> Vec<Replay> {
+    missed.iter().copied().filter(|replay| matches!(replay, Replay::Key(key) if key.up)).collect()
 }
 
 /// One event of the replay queue, injected in queue order with one `SendInput` call.
@@ -295,11 +326,36 @@ impl HookLogic {
         }
     }
 
-    /// Any other button or wheel event. Passed through, unless a replay is still
-    /// queued: then it is swallowed and queued behind it, so the app sees every
-    /// event in the order it happened.
+    /// Any other button or wheel event. Passed through, unless something is
+    /// waiting: then it is swallowed and queued behind it, so the app sees
+    /// every event in the order it happened. Modifiers held behind a pending
+    /// press end the hold first (see the module docs, "Stream order").
     pub fn other_button(&mut self, event: ReplayEvent) -> bool {
+        self.end_hold_for_ordered_input();
         self.defer_while_replaying(event)
+    }
+
+    /// Any key other than Escape and the modifiers (letters, Enter, Tab,
+    /// arrows, function keys...) went down or up. Passed through unless
+    /// something is waiting: then it is swallowed and queued behind it, and
+    /// modifiers held behind a pending press end the hold first (see the
+    /// module docs, "Stream order"). Returns true when the event must be
+    /// swallowed.
+    ///
+    /// `foreground_accepts` as for [`Self::modifier_key`]: asked only when no
+    /// key of the user is queued yet. If it refuses, the key passes at once
+    /// (UIPI would drop a replayed key-up and leave the key stuck).
+    pub fn other_key(&mut self, key: KeyStroke, foreground_accepts: impl FnOnce() -> bool) -> bool {
+        if self.held_keys.is_empty() && self.replays.is_empty() {
+            return false;
+        }
+        let keys_queued = !self.held_keys.is_empty() || self.replays.iter().any(Replay::is_user_key);
+        if !keys_queued && !foreground_accepts() {
+            return false;
+        }
+        self.end_hold_for_ordered_input();
+        self.enqueue(Replay::Key(key));
+        true
     }
 
     /// A modifier key (Shift, Ctrl, Alt or Win, see [`is_modifier_vk`]) went
@@ -419,10 +475,8 @@ impl HookLogic {
         self.abandon(false);
         self.log(LogLevel::Error, format!("Click replay failed, so TedCat stopped holding clicks: {reason}"));
         self.commands.push(Command::Disable {
-            status: HookStatus::Degraded(format!(
-                "Windows refused to replay a click ({reason}). TedCat stopped holding clicks; \
-                 turn the gesture back on from the tray menu."
-            )),
+            // What went wrong; the UI says what TedCat did about it.
+            status: HookStatus::Degraded(sentence(&format!("Windows refused to replay a click ({reason})"))),
             always_report: true,
         });
     }
@@ -459,9 +513,7 @@ impl HookLogic {
         self.commands.push(Command::Gesture(GestureEvent::Cancel));
         self.log(LogLevel::Error, "Internal error in the input hook; click holding was turned off.".to_owned());
         self.commands.push(Command::Disable {
-            status: HookStatus::Degraded(
-                "TedCat hit an internal error in its input hook and stopped holding clicks.".to_owned(),
-            ),
+            status: HookStatus::Degraded("TedCat hit an internal error in its input hook.".to_owned()),
             always_report: true,
         });
     }
@@ -507,6 +559,17 @@ impl HookLogic {
                 self.enqueue(Replay::Mouse(current));
                 true
             }
+        }
+    }
+
+    /// Input other than a move or a modifier arrived while modifiers wait
+    /// behind the pending press: the user is not holding still for a capture.
+    /// Ends the hold as a drag would, queuing the press and those modifiers,
+    /// so the event can follow them in order. (`held_keys` is only ever
+    /// filled while the press is pending.)
+    fn end_hold_for_ordered_input(&mut self) {
+        if !self.held_keys.is_empty() {
+            self.abandon(true);
         }
     }
 
@@ -1203,6 +1266,132 @@ mod tests {
         assert!(logic.is_idle());
     }
 
+    /// The A key as the low-level hook reports it.
+    fn key_a(up: bool) -> KeyStroke {
+        KeyStroke { vk: 0x41, scan: 0x1E, extended: false, up }
+    }
+
+    fn wheel(point: PointPx) -> ReplayEvent {
+        ReplayEvent::new(point, ReplayAction::Wheel(-120))
+    }
+
+    #[test]
+    fn a_key_typed_while_modifiers_wait_behind_the_press_ends_the_hold_in_order() {
+        let mut logic = HookLogic::new();
+        assert!(logic.left_down(ORIGIN, &ctx()));
+        assert!(logic.modifier_key(ctrl(false), accepts));
+        commands(&mut logic);
+        // Ctrl went down after the press; the A that follows must not overtake either.
+        assert!(logic.other_key(key_a(false), || panic!("a key of the user is already held")));
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(ctrl(false)), key(key_a(false))]);
+        assert_eq!(commands(&mut logic), vec![Command::Wake, Command::DisarmHoldTimer]);
+        assert!(logic.is_idle(), "the hold is over, as after a drag");
+        assert_eq!(logic.held(), None);
+        // The hold never comes back: a stale timeout begins no selection.
+        logic.hold_timeout(true);
+        assert!(gestures(&commands(&mut logic)).is_empty());
+        // With nothing queued any more, the rest flows straight through.
+        assert!(!logic.other_key(key_a(true), || panic!("nothing is queued: no need to ask")));
+        assert!(!logic.modifier_key(ctrl(true), || panic!("nothing is queued: no need to ask")));
+        assert!(!logic.left_up(ORIGIN));
+        assert!(!logic.has_queued_replays());
+    }
+
+    #[test]
+    fn keys_released_before_the_replay_is_sent_wait_behind_it() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.modifier_key(shift(false), accepts);
+        assert!(logic.other_key(key_a(false), accepts));
+        assert!(logic.other_key(key_a(true), || panic!("a key of the user is already queued")));
+        assert!(logic.modifier_key(shift(true), || panic!("a key of the user is already queued")));
+        assert!(logic.left_up(ORIGIN), "the release must not overtake the replayed press");
+        assert_eq!(
+            logic.take_replays(),
+            vec![down(ORIGIN), key(shift(false)), key(key_a(false)), key(key_a(true)), key(shift(true)), up(ORIGIN)]
+        );
+    }
+
+    #[test]
+    fn a_wheel_or_button_while_modifiers_wait_behind_the_press_ends_the_hold_in_order() {
+        let right = ReplayEvent::new(ORIGIN, ReplayAction::RightDown);
+        for event in [wheel(ORIGIN), right, ReplayEvent::new(ORIGIN, ReplayAction::XDown(1))] {
+            let mut logic = HookLogic::new();
+            logic.left_down(ORIGIN, &ctx());
+            logic.modifier_key(shift(false), accepts);
+            assert!(logic.other_button(event), "{event:?}");
+            assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(shift(false)), Replay::Mouse(event)], "{event:?}");
+            assert!(logic.is_idle());
+        }
+    }
+
+    #[test]
+    fn without_waiting_modifiers_other_input_passes_and_the_hold_goes_on() {
+        let mut logic = HookLogic::new();
+        assert!(logic.left_down(ORIGIN, &ctx()));
+        assert!(!logic.other_key(key_a(false), || panic!("nothing is waiting: no need to ask")));
+        assert!(!logic.other_button(wheel(ORIGIN)));
+        assert_eq!(logic.held(), Some(ORIGIN));
+        assert!(!logic.is_idle());
+        logic.hold_timeout(true);
+        assert_eq!(
+            gestures(&commands(&mut logic)),
+            vec![GestureEvent::Begin { origin: ORIGIN, mode: CaptureMode::Screenshot }]
+        );
+    }
+
+    #[test]
+    fn other_keys_behind_queued_replays_are_queued_when_the_foreground_takes_them() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.left_up(ORIGIN);
+        assert!(logic.other_key(key_a(false), accepts));
+        assert!(logic.other_key(key_a(true), refuses), "once a key is queued, its release must follow it");
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN), key(key_a(false)), key(key_a(true))]);
+
+        // An elevated foreground: the key passes, as modifiers do.
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.left_up(ORIGIN);
+        assert!(!logic.other_key(key_a(false), refuses));
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN)]);
+
+        // Behind the mask of an Alt press: queued, and the press stays pending.
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &PressContext { modifiers: Modifiers::ALT, ..ctx() });
+        assert!(logic.other_key(key_a(false), accepts));
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![mask_down, mask_up, key(key_a(false))]);
+        assert_eq!(logic.held(), Some(ORIGIN));
+    }
+
+    #[test]
+    fn escape_keeps_its_own_handling_while_modifiers_wait() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.modifier_key(ctrl(false), accepts);
+        assert!(!logic.escape(true, 1_000), "outside a selection Escape passes at once");
+        assert!(!logic.escape(false, 1_050));
+        assert_eq!(logic.held(), Some(ORIGIN), "and does not end the hold");
+        assert!(!logic.has_queued_replays());
+    }
+
+    #[test]
+    fn key_releases_are_retried_mask_key_included() {
+        let [mask_down, mask_up] = mask();
+        let missed =
+            [down(ORIGIN), key(ctrl(false)), mask_down, mask_up, key(key_a(true)), key(ctrl(true)), up(ORIGIN)];
+        assert_eq!(key_releases_to_retry(&missed), vec![mask_up, key(key_a(true)), key(ctrl(true))]);
+        assert!(key_releases_to_retry(&[down(ORIGIN), mask_down, up(ORIGIN)]).is_empty());
+    }
+
+    #[test]
+    fn unicode_packets_are_recognised() {
+        let packet = KeyStroke { vk: VK_PACKET, scan: 0x00E9, extended: false, up: false };
+        assert!(packet.is_unicode());
+        assert!(!key_a(false).is_unicode() && !KeyStroke::mask(false).is_unicode());
+    }
+
     #[test]
     fn modifier_virtual_keys() {
         for vk in [0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
@@ -1317,11 +1506,16 @@ mod tests {
         logic.left_up(ORIGIN);
         logic.take_replays();
         commands(&mut logic);
-        logic.replay_failed("1 of 2".to_owned());
+        logic.replay_failed("SendInput inserted 1 of 2 events, error 5".to_owned());
         let cmds = commands(&mut logic);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::Disable { status: HookStatus::Degraded(_), always_report: true })));
+        let degraded = cmds.iter().find_map(|c| match c {
+            Command::Disable { status: HookStatus::Degraded(reason), always_report: true } => Some(reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            degraded.as_deref(),
+            Some("Windows refused to replay a click (SendInput inserted 1 of 2 events, error 5).")
+        );
         assert!(logic.is_idle());
         assert!(!logic.has_queued_replays());
     }
