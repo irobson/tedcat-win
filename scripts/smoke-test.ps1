@@ -1010,6 +1010,7 @@ try {
             $endpoints = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction Stop | Where-Object { $_.Status -eq 'OK' })
             Note ("audio endpoints: {0}" -f $(if ($endpoints.Count) { ($endpoints | ForEach-Object { $_.FriendlyName }) -join ', ' } else { 'none' }))
         } catch { Note "audio endpoints: none ($($_.Exception.Message))" }
+        Note ("borderless capture consent for desktop apps: {0}" -f (Get-BorderlessConsent).Text)
         foreach ($dll in @('mfplat.dll', 'mfreadwrite.dll', 'mfh264enc.dll', 'msmpeg2venc.dll', 'd3d11.dll', 'Windows.Graphics.dll')) {
             Note ("{0}: {1}" -f $dll, (Test-Path -LiteralPath (Join-Path $env:windir "System32\$dll")))
         }
