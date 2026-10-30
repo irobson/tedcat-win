@@ -1,15 +1,26 @@
 //! Region video: Windows.Graphics.Capture on the region's monitor, cropped on
-//! the GPU into a CPU-readable staging texture, throttled to 30 fps and handed
-//! to the sink writer as top-down RGB32 frames.
+//! the GPU, read back through a CPU-readable staging texture, throttled to
+//! 30 fps and handed to the sink writer as top-down RGB32 frames.
+//!
+//! A region larger than the encoder accepts (see `VideoEncodingPlan`) is
+//! cropped at its own size and scaled down to the encoded size: on the GPU by
+//! the D3D11 video processor, or on the CPU (`frame::scale_bgra_into`) when
+//! the GPU cannot. The thumbnail and the encoder backlog use the encoded size.
 //!
 //! The frame pool is free threaded, so `FrameArrived` runs on a capture
 //! thread pool thread; all per-frame state lives behind a `Mutex`.
+//!
+//! The pool is never recreated. When the display's size changes (resolution
+//! or rotation), its frames no longer match the pool and the region no longer
+//! means the same pixels, so the recording is interrupted; stop then
+//! finalizes what was captured before the change.
 //!
 //! Frames are written one frame late: each frame's duration is the time until
 //! the next kept frame, which is exact even though capture only delivers
 //! frames when pixels change. The last frame is handed back on stop so the
 //! recorder can extend it to the stop time.
 
+use std::mem::ManuallyDrop;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,15 +31,24 @@ use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Win32::Foundation::{E_FAIL, HMODULE};
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{E_FAIL, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, D3D11_BOX,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11RenderTargetView, ID3D11Texture2D,
+    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+    D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_QUALITY,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, DXGI_ERROR_UNSUPPORTED};
 use windows::Win32::Media::MediaFoundation::IMFMediaBuffer;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
@@ -44,6 +64,13 @@ use crate::{log_info, log_warn};
 
 /// How long `start` waits for the first captured frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Why a recording stops when the monitor's size changes under it. No final
+/// period: the UI appends its own sentence.
+const DISPLAY_CHANGED: &str = "The display resolution changed during the recording";
+
+/// Opaque black, for the parts of the region outside the captured content.
+const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// A captured frame waiting to be written (or the last one, at stop).
 pub(super) struct PendingFrame {
@@ -64,12 +91,49 @@ pub(super) struct VideoOutcome {
 /// GPU objects used by the frame callback.
 struct Gpu {
     context: ID3D11DeviceContext,
+    /// CPU-readable texture the picture is read back from: the region at its
+    /// source size, or the encoded picture when the GPU scales it.
     staging: ID3D11Texture2D,
+    scaling: Scaling,
+}
+
+/// How the cropped region becomes the encoded picture.
+enum Scaling {
+    /// The region is encoded at its own size.
+    None,
+    /// The D3D11 video processor scales the region on the GPU.
+    Gpu(GpuScaler),
+    /// The staging texture holds the region at its source size and each frame
+    /// is scaled on the CPU, through `scratch` (the region, black-filled).
+    Cpu { scratch: Vec<u8> },
+}
+
+/// Scales the cropped region to the encoded size with the D3D11 video processor.
+struct GpuScaler {
+    /// The immediate context's critical section, held for each frame's whole
+    /// clear / copy / blit / read-back sequence (see `DeviceSection`).
+    lock: Option<ID3D11Multithread>,
+    video_context: ID3D11VideoContext,
+    processor: ID3D11VideoProcessor,
+    /// The region at its source size: the crop lands here.
+    region: ID3D11Texture2D,
+    /// Render target view of `region`, to black out what the frame does not cover.
+    region_target: ID3D11RenderTargetView,
+    region_input: ID3D11VideoProcessorInputView,
+    /// The encoded picture, copied to the staging texture after each blit.
+    output: ID3D11Texture2D,
+    output_view: ID3D11VideoProcessorOutputView,
+    _enumerator: ID3D11VideoProcessorEnumerator,
 }
 
 struct VideoState {
     gpu: Option<Gpu>,
+    /// The region, at its source size.
     crop: CropInput,
+    /// Size of the encoded picture (equal to the crop size unless scaled).
+    encoded: (u32, u32),
+    /// The size the frame pool was created with: the monitor's at start.
+    pool_size: SizeInt32,
     throttle: FrameThrottle,
     pending: Option<PendingFrame>,
     thumbnail: Option<Thumbnail>,
@@ -81,9 +145,10 @@ struct VideoState {
     dropped: u64,
 }
 
-// SAFETY: D3D11 interfaces are free threaded (the device is created with
-// multithread protection on), and the Media Foundation buffer is free threaded
-// too. The state is only touched under its Mutex.
+// SAFETY: D3D11 interfaces, video processor ones included, are free threaded
+// (the immediate context has multithread protection on), and the Media
+// Foundation buffer is free threaded too. The state is only touched under its
+// Mutex.
 unsafe impl Send for VideoState {}
 
 /// A running monitor capture. Lives on the recorder thread.
@@ -127,7 +192,8 @@ impl VideoCapture {
                 monitor.rect.height()
             );
         }
-        let staging = create_staging(&device, plan.pixel_width, plan.pixel_height).map_err(|e| fail("staging texture", e))?;
+        let (staging, scaling) = create_scaling(&device, &context, plan).map_err(|e| fail("staging texture", e))?;
+        log_info!("frame pool {}x{}", size.Width, size.Height);
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -151,15 +217,17 @@ impl VideoCapture {
 
         let (first_tx, first_rx) = mpsc::sync_channel(1);
         let state = Arc::new(Mutex::new(VideoState {
-            gpu: Some(Gpu { context, staging }),
+            gpu: Some(Gpu { context, staging, scaling }),
             crop: CropInput {
                 region_left: region.left,
                 region_top: region.top,
                 monitor_left: monitor.rect.left,
                 monitor_top: monitor.rect.top,
-                out_width: plan.pixel_width,
-                out_height: plan.pixel_height,
+                out_width: plan.source_width,
+                out_height: plan.source_height,
             },
+            encoded: (plan.pixel_width, plan.pixel_height),
+            pool_size: size,
             throttle: FrameThrottle::new(VideoEncodingPlan::FRAMES_PER_SECOND),
             pending: None,
             thumbnail: None,
@@ -195,7 +263,7 @@ impl VideoCapture {
             }
         }
         let on_closed = TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
-            shared.interrupt("The display being recorded was disconnected.");
+            shared.interrupt("The display being recorded was disconnected");
             Ok(())
         });
         match capture.item.Closed(&on_closed) {
@@ -272,6 +340,19 @@ fn frame_arrived(state: &Mutex<VideoState>, shared: &Shared, pool: Option<&Direc
 impl VideoState {
     fn process(&mut self, frame: &Direct3D11CaptureFrame, shared: &Shared) -> Result<(), String> {
         let capture_error = |e: windows::core::Error| format!("Screen capture stopped: {}", describe(&e));
+        // Frames keep arriving in surfaces of the pool's size after the
+        // display changed, so the crop would show the wrong area (or black).
+        let content = frame.ContentSize().map_err(capture_error)?;
+        if content != self.pool_size {
+            log_warn!(
+                "the display changed from {}x{} to {}x{} during the recording",
+                self.pool_size.Width,
+                self.pool_size.Height,
+                content.Width,
+                content.Height
+            );
+            return Err(DISPLAY_CHANGED.into());
+        }
         let time = frame.SystemRelativeTime().map_err(capture_error)?.Duration;
         let t0 = shared.t0_or_init(time);
         let time = time - t0;
@@ -281,8 +362,7 @@ impl VideoState {
         if self.gpu.is_none() || (self.pending.is_some() && self.encoder_is_behind(shared)) {
             return Ok(());
         }
-        let Some(gpu) = self.gpu.as_ref() else { return Ok(()) };
-        let content = frame.ContentSize().map_err(capture_error)?;
+        let Some(gpu) = self.gpu.as_mut() else { return Ok(()) };
         let texture: ID3D11Texture2D = frame
             .Surface()
             .and_then(|surface| surface.cast::<IDirect3DDxgiInterfaceAccess>())
@@ -301,30 +381,17 @@ impl VideoState {
                 "region only partly inside the captured content ({available_width}x{available_height}); filling with black"
             );
         }
-        if let Some(copy) = copy {
-            let source_box = D3D11_BOX {
-                left: copy.src_left,
-                top: copy.src_top,
-                front: 0,
-                right: copy.src_right,
-                bottom: copy.src_bottom,
-                back: 1,
-            };
-            // SAFETY: the box lies inside the source texture and the destination
-            // offset plus box size fits the staging texture (see `crop_copy`).
-            unsafe {
-                gpu.context.CopySubresourceRegion(&gpu.staging, 0, copy.dst_x, copy.dst_y, 0, &texture, 0, Some(&source_box))
-            };
-        }
-        let (width, height) = (self.crop.out_width, self.crop.out_height);
+        let source = (self.crop.out_width, self.crop.out_height);
+        let (width, height) = self.encoded;
         let mut thumbnail = None;
         let wants_thumbnail = self.thumbnail.is_none();
-        let buffer = read_staging(gpu, width, height, copy, |picture| {
-            if wants_thumbnail {
-                thumbnail = Some(make_thumbnail(picture, width, height));
-            }
-        })
-        .map_err(capture_error)?;
+        let buffer = gpu
+            .picture(&texture, copy, source, self.encoded, |picture| {
+                if wants_thumbnail {
+                    thumbnail = Some(make_thumbnail(picture, width, height));
+                }
+            })
+            .map_err(capture_error)?;
         if thumbnail.is_some() {
             self.thumbnail = thumbnail;
         }
@@ -347,7 +414,7 @@ impl VideoState {
     /// True when too many raw frames already wait for the encoder; the frame
     /// is then skipped (the previous one simply stays on screen longer).
     fn encoder_is_behind(&mut self, shared: &Shared) -> bool {
-        let frame_bytes = self.crop.out_width as usize * self.crop.out_height as usize * 4;
+        let frame_bytes = self.encoded.0 as usize * self.encoded.1 as usize * 4;
         let behind = shared.writer().video_backlog().is_some_and(|backlog| backlog > frame::max_video_backlog(frame_bytes));
         if behind {
             if self.dropped == 0 {
@@ -359,19 +426,229 @@ impl VideoState {
     }
 }
 
-/// Maps the staging texture and copies the picture into a new media buffer.
+impl Gpu {
+    /// Puts the visible part of the region (`copy`, from the captured
+    /// `frame`) into a new media buffer holding the encoded picture, black
+    /// where the frame does not cover the region. `inspect` sees the finished
+    /// picture. `source` is the region's size, `encoded` the picture's.
+    fn picture(
+        &mut self,
+        frame: &ID3D11Texture2D,
+        copy: Option<CropCopy>,
+        source: (u32, u32),
+        encoded: (u32, u32),
+        inspect: impl FnOnce(&[u8]),
+    ) -> windows::core::Result<IMFMediaBuffer> {
+        let (source_width, source_height) = source;
+        let (width, height) = encoded;
+        let len = width as usize * height as usize * 4;
+        match &mut self.scaling {
+            Scaling::None => {
+                if let Some(copy) = copy {
+                    copy_region(&self.context, &self.staging, frame, copy);
+                }
+                read_staging(&self.context, &self.staging, width, height, len, |rows, pitch, picture| {
+                    frame::copy_picture(rows, pitch, picture, width, height, copy);
+                    inspect(picture);
+                })
+            }
+            Scaling::Gpu(scaler) => {
+                let _section = scaler.lock.as_ref().map(DeviceSection::enter);
+                scaler.scale(&self.context, frame, copy, source)?;
+                // SAFETY: the output and staging textures are both `encoded` BGRA.
+                unsafe { self.context.CopyResource(&self.staging, &scaler.output) };
+                read_staging(&self.context, &self.staging, width, height, len, |rows, pitch, picture| {
+                    frame::copy_picture(rows, pitch, picture, width, height, Some(CropCopy::full(width, height)));
+                    inspect(picture);
+                })
+            }
+            Scaling::Cpu { scratch } => {
+                if let Some(copy) = copy {
+                    copy_region(&self.context, &self.staging, frame, copy);
+                }
+                scratch.resize(source_width as usize * source_height as usize * 4, 0);
+                read_staging(&self.context, &self.staging, source_width, source_height, len, |rows, pitch, picture| {
+                    frame::copy_picture(rows, pitch, scratch, source_width, source_height, copy);
+                    frame::scale_bgra_into(scratch, source_width, source_height, source_width as usize * 4, picture, width, height);
+                    inspect(picture);
+                })
+            }
+        }
+    }
+}
+
+impl GpuScaler {
+    /// Sets up the video processor for `source` -> `encoded` BGRA and checks
+    /// that it really works; fails when the GPU (or WARP) cannot do it.
+    fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        source: (u32, u32),
+        encoded: (u32, u32),
+    ) -> windows::core::Result<GpuScaler> {
+        let video_device: ID3D11VideoDevice = device.cast()?;
+        let video_context: ID3D11VideoContext = context.cast()?;
+        let rate = DXGI_RATIONAL { Numerator: VideoEncodingPlan::FRAMES_PER_SECOND, Denominator: 1 };
+        let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: source.0,
+            InputHeight: source.1,
+            OutputFrameRate: rate,
+            OutputWidth: encoded.0,
+            OutputHeight: encoded.1,
+            Usage: D3D11_VIDEO_USAGE_OPTIMAL_QUALITY,
+        };
+        let missing = || windows::core::Error::from_hresult(E_FAIL);
+        // SAFETY: D3D11 video calls with valid descriptions and out-parameters,
+        // on objects created here from the same device.
+        unsafe {
+            let enumerator = video_device.CreateVideoProcessorEnumerator(&content)?;
+            let needed = (D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0) as u32;
+            if enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)? & needed != needed {
+                return Err(windows::core::Error::new(DXGI_ERROR_UNSUPPORTED, "the video processor cannot convert BGRA to BGRA"));
+            }
+            let processor = video_device.CreateVideoProcessor(&enumerator, 0)?;
+            let region_bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+            let region = create_texture(device, source.0, source.1, D3D11_USAGE_DEFAULT, region_bind, 0)?;
+            let output = create_texture(device, encoded.0, encoded.1, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET.0 as u32, 0)?;
+            let mut region_target = None;
+            device.CreateRenderTargetView(&region, None, Some(&mut region_target))?;
+            let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 } },
+            };
+            let mut region_input = None;
+            video_device.CreateVideoProcessorInputView(&region, &enumerator, &input_desc, Some(&mut region_input))?;
+            let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
+            };
+            let mut output_view = None;
+            video_device.CreateVideoProcessorOutputView(&output, &enumerator, &output_desc, Some(&mut output_view))?;
+
+            // The whole region in, the whole picture out, full-range RGB on
+            // both sides, and no driver "enhancements" on screen content.
+            let whole_region = RECT { left: 0, top: 0, right: source.0 as i32, bottom: source.1 as i32 };
+            let whole_picture = RECT { left: 0, top: 0, right: encoded.0 as i32, bottom: encoded.1 as i32 };
+            // All bits zero: playback usage, RGB range 0-255.
+            let full_range_rgb = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 };
+            video_context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&whole_region));
+            video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&whole_picture));
+            video_context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole_picture));
+            video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &full_range_rgb);
+            video_context.VideoProcessorSetOutputColorSpace(&processor, &full_range_rgb);
+            video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+
+            let scaler = GpuScaler {
+                lock: context.cast::<ID3D11Multithread>().ok(),
+                video_context,
+                processor,
+                region,
+                region_target: region_target.ok_or_else(missing)?,
+                region_input: region_input.ok_or_else(missing)?,
+                output,
+                output_view: output_view.ok_or_else(missing)?,
+                _enumerator: enumerator,
+            };
+            // Some drivers list the format but fail the blit: find out now,
+            // while the CPU can still take over, not on the first frame.
+            context.ClearRenderTargetView(&scaler.region_target, &BLACK);
+            scaler.blit()?;
+            Ok(scaler)
+        }
+    }
+
+    /// Copies the visible part of the region into `region` (blacking out the
+    /// rest when the frame does not cover it all) and scales it into `output`.
+    fn scale(
+        &self,
+        context: &ID3D11DeviceContext,
+        frame: &ID3D11Texture2D,
+        copy: Option<CropCopy>,
+        source: (u32, u32),
+    ) -> windows::core::Result<()> {
+        if copy.is_none_or(|c| !c.covers(source.0, source.1)) {
+            // SAFETY: a render target view of a texture this scaler owns.
+            unsafe { context.ClearRenderTargetView(&self.region_target, &BLACK) };
+        }
+        if let Some(copy) = copy {
+            copy_region(context, &self.region, frame, copy);
+        }
+        self.blit()
+    }
+
+    /// Scales `region` into `output`.
+    fn blit(&self) -> windows::core::Result<()> {
+        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            pInputSurface: ManuallyDrop::new(Some(self.region_input.clone())),
+            ..Default::default()
+        };
+        // SAFETY: one enabled stream with a valid input view; the processor and
+        // both views come from the same enumerator and device.
+        let result = unsafe {
+            self.video_context.VideoProcessorBlt(&self.processor, &self.output_view, 0, std::slice::from_ref(&stream))
+        };
+        // Releases the reference the stream held.
+        drop(ManuallyDrop::into_inner(stream.pInputSurface));
+        result
+    }
+}
+
+/// Holds a device's multithread critical section until dropped. WGC uses the
+/// device from its own threads; holding the section keeps those calls from
+/// interleaving with a frame's video context work. The section is recursive,
+/// so the runtime's own per-call locking inside it is fine.
+struct DeviceSection<'a>(&'a ID3D11Multithread);
+
+impl<'a> DeviceSection<'a> {
+    fn enter(lock: &'a ID3D11Multithread) -> DeviceSection<'a> {
+        // SAFETY: balanced by Leave in Drop, on the same thread.
+        unsafe { lock.Enter() };
+        DeviceSection(lock)
+    }
+}
+
+impl Drop for DeviceSection<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard entered the section in `enter`.
+        unsafe { self.0.Leave() };
+    }
+}
+
+/// Copies the visible part of the region (`copy`) from the captured `frame`
+/// into `target`, a texture of the region's size.
+fn copy_region(context: &ID3D11DeviceContext, target: &ID3D11Texture2D, frame: &ID3D11Texture2D, copy: CropCopy) {
+    let source_box = D3D11_BOX {
+        left: copy.src_left,
+        top: copy.src_top,
+        front: 0,
+        right: copy.src_right,
+        bottom: copy.src_bottom,
+        back: 1,
+    };
+    // SAFETY: the box lies inside the frame texture and the destination
+    // offset plus box size fits `target` (see `crop_copy`).
+    unsafe { context.CopySubresourceRegion(target, 0, copy.dst_x, copy.dst_y, 0, frame, 0, Some(&source_box)) };
+}
+
+/// Maps `staging` (`width` x `height` pixels) and fills a new `len`-byte media
+/// buffer from it with `fill(rows, row_pitch, buffer)`.
 fn read_staging(
-    gpu: &Gpu,
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
     width: u32,
     height: u32,
-    copy: Option<CropCopy>,
-    inspect: impl FnOnce(&[u8]),
+    len: usize,
+    fill: impl FnOnce(&[u8], usize, &mut [u8]),
 ) -> windows::core::Result<IMFMediaBuffer> {
-    let len = width as usize * height as usize * 4;
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: the staging texture was created with CPU read access; it is
     // unmapped below on every path.
-    unsafe { gpu.context.Map(&gpu.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
     let result = if mapped.pData.is_null() || height == 0 {
         Err(windows::core::Error::from_hresult(E_FAIL))
     } else {
@@ -380,13 +657,10 @@ fn read_staging(
         // SAFETY: a mapped staging texture of `height` rows holds at least
         // `RowPitch * (height - 1) + width * 4` readable bytes.
         let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, src_len) };
-        new_buffer(len, |dst| {
-            frame::copy_picture(src, pitch, dst, width, height, copy);
-            inspect(dst);
-        })
+        new_buffer(len, |dst| fill(src, pitch, dst))
     };
     // SAFETY: balances the successful Map above.
-    unsafe { gpu.context.Unmap(&gpu.staging, 0) };
+    unsafe { context.Unmap(staging, 0) };
     result
 }
 
@@ -463,7 +737,51 @@ fn capture_item(monitor: &MonitorInfo) -> windows::core::Result<GraphicsCaptureI
     unsafe { interop.CreateForMonitor(monitor.hmonitor()) }
 }
 
+/// The staging texture and the scaling `plan` needs: none when the region is
+/// encoded at its own size, else the GPU video processor, or the CPU when the
+/// GPU cannot scale.
+fn create_scaling(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    plan: &VideoEncodingPlan,
+) -> windows::core::Result<(ID3D11Texture2D, Scaling)> {
+    let source = (plan.source_width, plan.source_height);
+    let encoded = (plan.pixel_width, plan.pixel_height);
+    if !plan.is_scaled() {
+        return Ok((create_staging(device, source.0, source.1)?, Scaling::None));
+    }
+    match GpuScaler::new(device, context, source, encoded) {
+        Ok(scaler) => {
+            log_info!("scaling the {}x{} region to {}x{} on the GPU", source.0, source.1, encoded.0, encoded.1);
+            Ok((create_staging(device, encoded.0, encoded.1)?, Scaling::Gpu(scaler)))
+        }
+        Err(e) => {
+            log_warn!(
+                "scaling the {}x{} region to {}x{} on the CPU: the GPU video processor is unavailable ({})",
+                source.0,
+                source.1,
+                encoded.0,
+                encoded.1,
+                describe(&e)
+            );
+            Ok((create_staging(device, source.0, source.1)?, Scaling::Cpu { scratch: Vec::new() }))
+        }
+    }
+}
+
 fn create_staging(device: &ID3D11Device, width: u32, height: u32) -> windows::core::Result<ID3D11Texture2D> {
+    create_texture(device, width, height, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)
+}
+
+/// A single BGRA texture without mipmaps.
+fn create_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    usage: D3D11_USAGE,
+    bind_flags: u32,
+    cpu_access: u32,
+) -> windows::core::Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
@@ -471,13 +789,13 @@ fn create_staging(device: &ID3D11Device, width: u32, height: u32) -> windows::co
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        Usage: usage,
+        BindFlags: bind_flags,
+        CPUAccessFlags: cpu_access,
         MiscFlags: 0,
     };
     let mut texture = None;
-    // SAFETY: `desc` describes a valid staging texture; no initial data.
+    // SAFETY: `desc` describes a valid texture; no initial data.
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
     texture.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))
 }

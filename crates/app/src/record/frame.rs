@@ -1,5 +1,7 @@
 //! Pure picture math for region recordings: where to crop a captured monitor
-//! frame, how to copy it into the encoder's buffer, and the thumbnail.
+//! frame, how to copy it into the encoder's buffer, how to scale it down when
+//! the region is larger than the encoder accepts (CPU fallback), and the
+//! thumbnail.
 //!
 //! All sizes are physical pixels; pictures are BGRA, 4 bytes per pixel,
 //! top-down rows. Nothing in this file touches Win32.
@@ -15,7 +17,8 @@ pub(crate) struct CropInput {
     pub region_top: i32,
     pub monitor_left: i32,
     pub monitor_top: i32,
-    /// Encoded picture size (the even size from the encoding plan).
+    /// Size of the captured region (the plan's even source size). The
+    /// encoded picture is this size too, unless the plan scales it down.
     pub out_width: u32,
     pub out_height: u32,
 }
@@ -33,6 +36,12 @@ pub(crate) struct CropCopy {
 }
 
 impl CropCopy {
+    /// A copy that fills a whole `width` x `height` picture from the same
+    /// place in a source of that size.
+    pub(crate) fn full(width: u32, height: u32) -> CropCopy {
+        CropCopy { src_left: 0, src_top: 0, src_right: width, src_bottom: height, dst_x: 0, dst_y: 0 }
+    }
+
     pub(crate) fn width(&self) -> u32 {
         self.src_right - self.src_left
     }
@@ -133,37 +142,54 @@ pub(crate) fn fit_within(width: u32, height: u32, max_width: u32, max_height: u3
 /// nearest pixel when enlarging). Alpha is forced to 255.
 pub(crate) fn scale_bgra(src: &[u8], src_width: u32, src_height: u32, src_stride: usize, width: u32, height: u32) -> Vec<u8> {
     let mut out = vec![0u8; width as usize * height as usize * 4];
+    scale_bgra_into(src, src_width, src_height, src_stride, &mut out, width, height);
+    out
+}
+
+/// `scale_bgra` into `dst`, which receives `height` tightly packed rows of
+/// `width` pixels (it must hold at least `width * height * 4` bytes). Used
+/// every frame when a region larger than the encoder accepts is scaled on the
+/// CPU, so the column spans are worked out once per call, not per pixel.
+pub(crate) fn scale_bgra_into(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+) {
+    let row_bytes = width as usize * 4;
+    let dst = &mut dst[..row_bytes * height as usize];
     if src_width == 0 || src_height == 0 || width == 0 || height == 0 {
-        return out;
+        dst.fill(0);
+        return;
     }
     let span = |i: u32, from: u32, to: u32| -> (usize, usize) {
         let start = (i as u64 * from as u64 / to as u64) as usize;
         let end = (((i as u64 + 1) * from as u64 / to as u64) as usize).max(start + 1).min(from as usize);
         (start, end)
     };
-    for y in 0..height {
-        let (sy0, sy1) = span(y, src_height, height);
-        for x in 0..width {
-            let (sx0, sx1) = span(x, src_width, width);
+    let columns: Vec<(usize, usize)> = (0..width).map(|x| span(x, src_width, width)).collect();
+    for (y, out_row) in dst.chunks_exact_mut(row_bytes).enumerate() {
+        let (sy0, sy1) = span(y as u32, src_height, height);
+        for (out, &(sx0, sx1)) in out_row.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
             let mut sum = [0u64; 3];
             for sy in sy0..sy1 {
-                let row = &src[sy * src_stride..];
-                for sx in sx0..sx1 {
-                    let p = &row[sx * 4..sx * 4 + 3];
+                let row = &src[sy * src_stride + sx0 * 4..sy * src_stride + sx1 * 4];
+                for p in row.as_chunks::<4>().0 {
                     sum[0] += p[0] as u64;
                     sum[1] += p[1] as u64;
                     sum[2] += p[2] as u64;
                 }
             }
             let count = ((sy1 - sy0) * (sx1 - sx0)) as u64;
-            let o = (y as usize * width as usize + x as usize) * 4;
             for c in 0..3 {
-                out[o + c] = ((sum[c] + count / 2) / count) as u8;
+                out[c] = ((sum[c] + count / 2) / count) as u8;
             }
-            out[o + 3] = 255;
+            out[3] = 255;
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -289,5 +315,58 @@ mod tests {
         src[..4].copy_from_slice(&[1, 2, 3, 4]);
         src[16..20].copy_from_slice(&[5, 6, 7, 8]);
         assert_eq!(scale_bgra(&src, 1, 2, 16, 1, 2), vec![1, 2, 3, 255, 5, 6, 7, 255]);
+    }
+
+    #[test]
+    fn a_full_copy_covers_the_whole_picture() {
+        let copy = CropCopy::full(640, 360);
+        assert!(copy.covers(640, 360));
+        assert_eq!((copy.width(), copy.height()), (640, 360));
+        assert!(!copy.covers(640, 362));
+    }
+
+    /// The straightforward per-pixel box filter `scale_bgra_into` must match.
+    fn reference_scale(src: &[u8], sw: usize, sh: usize, stride: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let (y0, y1) = (y * sh / h, ((y + 1) * sh / h).max(y * sh / h + 1).min(sh));
+            for x in 0..w {
+                let (x0, x1) = (x * sw / w, ((x + 1) * sw / w).max(x * sw / w + 1).min(sw));
+                for c in 0..3 {
+                    let mut sum = 0usize;
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            sum += src[sy * stride + sx * 4 + c] as usize;
+                        }
+                    }
+                    let count = (y1 - y0) * (x1 - x0);
+                    out[(y * w + x) * 4 + c] = ((sum + count / 2) / count) as u8;
+                }
+                out[(y * w + x) * 4 + 3] = 255;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scaling_into_a_buffer_matches_a_plain_box_filter() {
+        // Uneven ratios like 5120 -> 4096 (1.25) and odd padding.
+        for (sw, sh, w, h) in [(20, 12, 16, 8), (25, 9, 20, 7), (10, 10, 10, 10), (7, 5, 3, 2), (4, 4, 6, 6)] {
+            let stride = sw * 4 + 12;
+            let src: Vec<u8> = (0..stride * sh).map(|i| (i * 37 % 251) as u8).collect();
+            let mut dst = vec![0xAA; w * h * 4 + 8];
+            scale_bgra_into(&src, sw as u32, sh as u32, stride, &mut dst, w as u32, h as u32);
+            assert_eq!(&dst[..w * h * 4], &reference_scale(&src, sw, sh, stride, w, h)[..], "{sw}x{sh} -> {w}x{h}");
+            // Bytes past the picture are left alone.
+            assert!(dst[w * h * 4..].iter().all(|&b| b == 0xAA));
+            assert_eq!(scale_bgra(&src, sw as u32, sh as u32, stride, w as u32, h as u32), &dst[..w * h * 4]);
+        }
+    }
+
+    #[test]
+    fn scaling_an_empty_source_gives_black() {
+        let mut dst = vec![0xAA; 16];
+        scale_bgra_into(&[], 0, 0, 0, &mut dst, 2, 2);
+        assert!(dst.iter().all(|&b| b == 0));
     }
 }

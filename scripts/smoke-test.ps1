@@ -1384,6 +1384,443 @@ try {
             Test-CounterClick "the click after TedCat died while the press was $phase" $false
         }
     }
+
+    # =======================================================================
+    # Recording fixes: delay-loaded Media Foundation, regions scaled down to
+    # what the encoder accepts, and display changes during a recording.
+    #
+    #   recording-delay-load
+    #                 mfplat.dll and mfreadwrite.dll are delay-load imports of
+    #                 TedCat.exe, not normal ones, so it starts on Windows N
+    #                 without the Media Feature Pack (dumpbin, or llvm-readobj).
+    #   recording-downscale
+    #                 with TEDCAT_TEST_MAX_VIDEO_SIZE=240x240 a 480x320 region
+    #                 takes the path a region wider than 4096 px takes for
+    #                 real: cropped at 480x320, scaled to 240x160 (GPU or CPU,
+    #                 logged), the file is 240x160 and shows the region.
+    #   recording-display-change
+    #                 the display resolution changes mid-recording: TedCat
+    #                 interrupts the recording with a clear reason and still
+    #                 saves what it captured. The resolution and the test
+    #                 window are restored afterwards.
+    #
+    # Each step starts its own TedCat and stops it at the end.
+
+    $recordFixHelpers = @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+namespace TedCatSmokeRecordFix
+{
+    /// A display mode of the primary display.
+    public class Mode
+    {
+        public Display.DEVMODE Dev;
+        public int Width { get { return (int)Dev.dmPelsWidth; } }
+        public int Height { get { return (int)Dev.dmPelsHeight; } }
+        public override string ToString()
+        {
+            return Dev.dmPelsWidth + "x" + Dev.dmPelsHeight + " " + Dev.dmBitsPerPel + " bpp " + Dev.dmDisplayFrequency + " Hz";
+        }
+    }
+
+    public static class Display
+    {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DEVMODE
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public ushort dmSpecVersion;
+            public ushort dmDriverVersion;
+            public ushort dmSize;
+            public ushort dmDriverExtra;
+            public uint dmFields;
+            public int dmPositionX;
+            public int dmPositionY;
+            public uint dmDisplayOrientation;
+            public uint dmDisplayFixedOutput;
+            public short dmColor;
+            public short dmDuplex;
+            public short dmYResolution;
+            public short dmTTOption;
+            public short dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public ushort dmLogPixels;
+            public uint dmBitsPerPel;
+            public uint dmPelsWidth;
+            public uint dmPelsHeight;
+            public uint dmDisplayFlags;
+            public uint dmDisplayFrequency;
+            public uint dmICMMethod;
+            public uint dmICMIntent;
+            public uint dmMediaType;
+            public uint dmDitherType;
+            public uint dmReserved1;
+            public uint dmReserved2;
+            public uint dmPanningWidth;
+            public uint dmPanningHeight;
+        }
+
+        const int ENUM_CURRENT_SETTINGS = -1;
+        const uint CDS_TEST = 0x2;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE devMode);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE devMode, IntPtr hwnd, uint flags, IntPtr param);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "ChangeDisplaySettingsExW")]
+        static extern int ChangeDisplaySettingsExNull(string device, IntPtr devMode, IntPtr hwnd, uint flags, IntPtr param);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+
+        static DEVMODE Blank()
+        {
+            DEVMODE dm = new DEVMODE();
+            dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+            return dm;
+        }
+
+        public static Mode Current()
+        {
+            DEVMODE dm = Blank();
+            if (!EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref dm)) return null;
+            Mode mode = new Mode();
+            mode.Dev = dm;
+            return mode;
+        }
+
+        /// Every mode of the primary display, as "WxH bpp Hz".
+        public static string[] All()
+        {
+            List<string> found = new List<string>();
+            DEVMODE dm = Blank();
+            for (int i = 0; EnumDisplaySettings(null, i, ref dm); i++)
+            {
+                Mode mode = new Mode();
+                mode.Dev = dm;
+                string text = mode.ToString();
+                if (!found.Contains(text)) found.Add(text);
+                dm = Blank();
+            }
+            return found.ToArray();
+        }
+
+        /// A mode with another size and the same colour depth: 800x600 if
+        /// offered, else the largest one smaller than `current`, else any.
+        public static Mode FindOther(Mode current)
+        {
+            Mode preferred = null, smaller = null, any = null;
+            DEVMODE dm = Blank();
+            for (int i = 0; EnumDisplaySettings(null, i, ref dm); i++)
+            {
+                if (dm.dmBitsPerPel == current.Dev.dmBitsPerPel
+                    && (dm.dmPelsWidth != current.Dev.dmPelsWidth || dm.dmPelsHeight != current.Dev.dmPelsHeight))
+                {
+                    Mode mode = new Mode();
+                    mode.Dev = dm;
+                    if (dm.dmPelsWidth == 800 && dm.dmPelsHeight == 600) preferred = mode;
+                    if (dm.dmPelsWidth <= current.Dev.dmPelsWidth && dm.dmPelsHeight <= current.Dev.dmPelsHeight
+                        && (smaller == null || (long)dm.dmPelsWidth * dm.dmPelsHeight > (long)smaller.Width * smaller.Height))
+                    {
+                        smaller = mode;
+                    }
+                    if (any == null) any = mode;
+                }
+                dm = Blank();
+            }
+            return preferred ?? smaller ?? any;
+        }
+
+        /// ChangeDisplaySettingsEx for the primary display, for this session
+        /// only (never written to the registry). 0 means DISP_CHANGE_SUCCESSFUL.
+        public static int Apply(Mode mode, bool testOnly)
+        {
+            DEVMODE dm = mode.Dev;
+            dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
+            return ChangeDisplaySettingsEx(null, ref dm, IntPtr.Zero, testOnly ? CDS_TEST : 0u, IntPtr.Zero);
+        }
+
+        /// Back to the mode stored in the registry.
+        public static int Reset()
+        {
+            return ChangeDisplaySettingsExNull(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        }
+
+        /// The primary screen's size right now ("WxH"), from GetSystemMetrics.
+        public static string ScreenSize()
+        {
+            return GetSystemMetrics(0) + "x" + GetSystemMetrics(1);
+        }
+
+        public static int[] FormBounds(Form form)
+        {
+            return (int[])form.Invoke(new Func<int[]>(delegate
+            {
+                Rectangle b = form.Bounds;
+                return new int[] { b.X, b.Y, b.Width, b.Height };
+            }));
+        }
+
+        public static void SetFormBounds(Form form, int[] bounds)
+        {
+            form.Invoke(new Action(delegate { form.Bounds = new Rectangle(bounds[0], bounds[1], bounds[2], bounds[3]); }));
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $recordFixHelpers -ReferencedAssemblies System.Windows.Forms, System.Drawing -Language CSharp
+
+    # dumpbin from the newest Visual Studio, else dumpbin or llvm-readobj on the PATH or in the LLVM folder.
+    function Find-RecordFixImportTool {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (Test-Path -LiteralPath $vswhere) {
+            $found = @((Invoke-Native $vswhere @('-latest', '-products', '*', '-find', 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe')) -split "`r?`n" | Where-Object { $_ -match 'dumpbin\.exe$' -and (Test-Path -LiteralPath $_.Trim()) })
+            if ($found.Count) { return [pscustomobject]@{ Kind = 'dumpbin'; Path = $found[0].Trim() } }
+        }
+        $command = Get-Command dumpbin -ErrorAction SilentlyContinue
+        if ($command) { return [pscustomobject]@{ Kind = 'dumpbin'; Path = $command.Source } }
+        $command = Get-Command llvm-readobj -ErrorAction SilentlyContinue
+        if ($command) { return [pscustomobject]@{ Kind = 'llvm-readobj'; Path = $command.Source } }
+        $candidate = Join-Path $env:ProgramFiles 'LLVM\bin\llvm-readobj.exe'
+        if (Test-Path -LiteralPath $candidate) { return [pscustomobject]@{ Kind = 'llvm-readobj'; Path = $candidate } }
+        return $null
+    }
+
+    function Stop-RecordFixTedCat {
+        if ($script:Ted -and -not $script:Ted.HasExited) {
+            Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+            [void]$script:Ted.WaitForExit(10000)
+        }
+        Get-Process -Name TedCat -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+
+    # A fresh TedCat with known settings; returns the log mark taken before it started.
+    function Start-RecordFixTedCat {
+        Stop-RecordFixTedCat
+        Write-Settings
+        $mark = Get-LogMark
+        $script:Ted = Start-TedCat
+        Assert ($null -ne (Wait-Log 'input hook status: Active' $mark 15000)) 'TedCat did not start (no "input hook status: Active")'
+        Note "TedCat started, pid $($script:Ted.Id)"
+        return $mark
+    }
+
+    function Get-RecordFixVideos {
+        if (-not (Test-Path -LiteralPath $VideosDir)) { return @() }
+        return @(Get-ChildItem -LiteralPath $VideosDir -Filter *.mp4 | ForEach-Object { $_.FullName })
+    }
+
+    # Shift + hold + drag over the region, then waits for the recording pill.
+    function Start-RecordFixRecording([int]$X1, [int]$Y1, [int]$W, [int]$H, [int]$Mark) {
+        Invoke-Input ([TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $false)) 'Shift down'
+        try {
+            Start-Sleep -Milliseconds 80
+            Invoke-HoldDrag $X1 $Y1 ($X1 + $W) ($Y1 + $H) 600
+            Start-Sleep -Milliseconds 80
+        } finally {
+            [void][TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $true)
+        }
+        $script:recordFixHud = $null
+        [void](Wait-Until { $script:recordFixHud = [TedCatSmoke.Win]::FindVisible('TedCat.Hud'); ($null -ne $script:recordFixHud) -or [bool]((Get-LogSince $Mark) -match 'recording could not start|too small to record') } 20000)
+        $failure = Wait-Log 'recording could not start: .*|too small to record' $Mark 200
+        if ($failure) { throw "TedCat did not start recording: $failure" }
+        Assert ($null -ne $script:recordFixHud) 'no recording pill (TedCat.Hud) appeared within 20 s'
+        $line = Wait-Log 'starting region recording.*' $Mark 500
+        if ($line) { Note $line }
+    }
+
+    # Clicks the recording pill and waits for "stopping the recording".
+    function Stop-RecordFixRecording([int]$Mark) {
+        $pill = [TedCatSmoke.Win]::FindVisible('TedCat.Hud')
+        Assert ($null -ne $pill) 'the recording pill disappeared before it was clicked'
+        $p = Center $pill
+        Invoke-Input ([TedCatSmoke.Input]::Click($p[0], $p[1], 40)) 'the click on the pill'
+        Assert ($null -ne (Wait-Log 'stopping the recording' $Mark 5000)) 'clicking the pill did not stop the recording'
+    }
+
+    # Waits until the recording is saved and returns the one new .mp4 (copied to the artifacts).
+    function Wait-RecordFixSaved([int]$Mark, [string[]]$Existing, [string]$ArtifactName) {
+        $saved = Wait-Log 'saved .* bytes|recording failed: .*' $Mark 30000
+        Assert ($null -ne $saved) 'the recording was not finalized within 30 s'
+        Note $saved
+        Assert ($saved -notmatch 'recording failed') "TedCat could not save the recording: $saved"
+        $new = @(Get-RecordFixVideos | Where-Object { $Existing -notcontains $_ })
+        Assert ($new.Count -eq 1) "expected one new .mp4 in $VideosDir, found $($new.Count)"
+        $file = Get-Item -LiteralPath $new[0]
+        Note ("{0}: {1} bytes" -f $file.Name, $file.Length)
+        Assert ($file.Length -gt 0) 'the recording is empty'
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $ArtifactsDir $ArtifactName) -Force
+        return $file
+    }
+
+    # ffprobe's view of the video stream (codec, width, height, duration), or $null without ffprobe.
+    function Get-RecordFixProbe([string]$Path) {
+        $ffprobe = Find-FFprobe
+        if (-not $ffprobe) { return $null }
+        $json = Invoke-Native $ffprobe @('-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height:format=duration', '-of', 'json', $Path)
+        $info = $json | ConvertFrom-Json
+        $video = @($info.streams | Where-Object { $_.codec_type -eq 'video' })
+        Assert ($video.Count -eq 1) "expected one video stream, ffprobe says: $json"
+        return [pscustomobject]@{ Codec = $video[0].codec_name; Width = [int]$video[0].width; Height = [int]$video[0].height; Duration = [double]$info.format.duration }
+    }
+
+    function Test-RecordFixColour([System.Drawing.Color]$Pixel, [int]$R, [int]$G, [int]$B, [int]$Tolerance) {
+        return ([Math]::Abs($Pixel.R - $R) -le $Tolerance -and [Math]::Abs($Pixel.G - $G) -le $Tolerance -and [Math]::Abs($Pixel.B - $B) -le $Tolerance)
+    }
+
+    Invoke-Step 'recording-delay-load' {
+        $tool = Find-RecordFixImportTool
+        if (-not $tool) { Skip 'neither dumpbin nor llvm-readobj is available to read the import table' }
+        Note "reading the imports of $Exe with $($tool.Kind) ($($tool.Path))"
+        if ($tool.Kind -eq 'dumpbin') {
+            $text = Invoke-Native $tool.Path @('/nologo', '/imports', $Exe)
+            # Normal imports come first; delay-load imports follow their own heading.
+            $at = $text.IndexOf('following delay load imports')
+            $normalText = if ($at -ge 0) { $text.Substring(0, $at) } else { $text }
+            $delayText = if ($at -ge 0) { $text.Substring($at) } else { '' }
+            $pattern = '(?im)^\s+([A-Za-z0-9_.\-]+\.dll)\s*$'
+            $normal = @([regex]::Matches($normalText, $pattern) | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() })
+            $delayed = @([regex]::Matches($delayText, $pattern) | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() })
+        } else {
+            $text = Invoke-Native $tool.Path @('--coff-imports', $Exe)
+            $normal = @([regex]::Matches($text, '(?m)^Import \{\s*Name: (\S+)') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() })
+            $delayed = @([regex]::Matches($text, '(?m)^DelayImport \{\s*Name: (\S+)') | ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() })
+        }
+        Note ("normal imports: {0}" -f ($normal -join ', '))
+        Note ("delay-load imports: {0}" -f $(if ($delayed.Count) { $delayed -join ', ' } else { 'none' }))
+        Assert ($normal.Count -gt 0) "could not read any import from the $($tool.Kind) output: $text"
+        foreach ($dll in @('mfplat.dll', 'mfreadwrite.dll')) {
+            Assert ($normal -notcontains $dll) "$dll is a normal import: TedCat.exe would not start on Windows N without the Media Feature Pack"
+            Assert ($delayed -contains $dll) "$dll is not a delay-load import of TedCat.exe"
+        }
+    }
+
+    Invoke-Step 'recording-downscale' {
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $w = 480; $h = 320
+        Assert (($canvas[2] - $canvas[0]) -ge $w + 60 -and ($canvas[3] - $canvas[1]) -ge $h + 60) "the canvas is too small for a ${w}x${h} region ($($canvas -join ','))"
+        $x1 = $canvas[0] + 30; $y1 = $canvas[1] + 30
+        # Half size: 480x320 -> 240x160.
+        $env:TEDCAT_TEST_MAX_VIDEO_SIZE = '240x240'
+        try { $mark = Start-RecordFixTedCat } finally { Remove-Item -LiteralPath Env:\TEDCAT_TEST_MAX_VIDEO_SIZE -ErrorAction SilentlyContinue }
+        try {
+            $existing = Get-RecordFixVideos
+            Start-RecordFixRecording $x1 $y1 $w $h $mark
+            Start-Sleep -Seconds $RecordSeconds
+            Stop-RecordFixRecording $mark
+            $file = Wait-RecordFixSaved $mark $existing 'downscaled.mp4'
+
+            $limit = Wait-Log 'TEDCAT_TEST_MAX_VIDEO_SIZE is set.*' $mark 100
+            $plan = Wait-Log "starting region recording .*: ${w}x${h} encoded as 240x160 at" $mark 100
+            $scaler = Wait-Log "scaling the ${w}x${h} region to 240x160 on the (GPU|CPU).*" $mark 100
+            Note "log: $(if ($limit) { $limit } else { '(no test limit line)' })"
+            Note "log: $(if ($scaler) { $scaler } else { '(no scaling line)' })"
+            Assert ($null -ne $plan) "TedCat did not plan to encode the ${w}x${h} region as 240x160"
+            Assert ($null -ne $scaler) 'TedCat did not log how it scales the region'
+
+            $probe = Get-RecordFixProbe $file.FullName
+            if (-not $probe) {
+                Note 'ffprobe not available: size and picture checks SKIPPED'
+            } else {
+                Note ("ffprobe: video {0} {1}x{2}, duration {3:N2} s" -f $probe.Codec, $probe.Width, $probe.Height, $probe.Duration)
+                Assert ($probe.Codec -eq 'h264') "video codec is $($probe.Codec), expected h264"
+                Assert ($probe.Width -eq 240 -and $probe.Height -eq 160) "video is $($probe.Width)x$($probe.Height), expected the scaled 240x160"
+                Assert ($probe.Duration -ge ($RecordSeconds - 0.5)) "duration $($probe.Duration) s is shorter than the ~$RecordSeconds s recorded"
+
+                # The scaled picture must still be the region: canvas green in
+                # the lower right, the ticker's black background top left.
+                $ffmpeg = Join-Path (Split-Path (Find-FFprobe)) 'ffmpeg.exe'
+                if (-not (Test-Path -LiteralPath $ffmpeg)) {
+                    Note 'ffmpeg not available: picture check SKIPPED'
+                } else {
+                    $png = Join-Path $ArtifactsDir 'downscaled-frame.png'
+                    Remove-Item -LiteralPath $png -Force -ErrorAction SilentlyContinue
+                    $out = Invoke-Native $ffmpeg @('-v', 'error', '-y', '-ss', '1', '-i', $file.FullName, '-frames:v', '1', $png)
+                    Assert (Test-Path -LiteralPath $png) "ffmpeg could not extract a frame: $out"
+                    $bitmap = New-Object System.Drawing.Bitmap $png
+                    try {
+                        $size = '{0}x{1}' -f $bitmap.Width, $bitmap.Height
+                        # Region (360, 240) = canvas (390, 270): plain canvas.
+                        $green = $bitmap.GetPixel(180, 120)
+                        # Region (180, 46) = ticker (150, 16): its black background, right of the text.
+                        $black = $bitmap.GetPixel(90, 23)
+                    } finally { $bitmap.Dispose() }
+                    $c = [TedCatSmoke.SmokeForm]::CanvasColor
+                    Note ("frame at 1 s: {0}; pixel (180,120) {1},{2},{3} (canvas {4},{5},{6}); pixel (90,23) {7},{8},{9} (ticker background black)" -f $size, $green.R, $green.G, $green.B, $c.R, $c.G, $c.B, $black.R, $black.G, $black.B)
+                    Assert ($size -eq '240x160') "the extracted frame is $size"
+                    Assert (Test-RecordFixColour $green $c.R $c.G $c.B 32) 'the scaled video does not show the canvas where it should (black, garbage or the wrong area)'
+                    Assert (Test-RecordFixColour $black 0 0 0 48) 'the scaled video does not show the ticker where it should (wrong area or scale)'
+                }
+            }
+            $card = Wait-Until { $null -ne [TedCatSmoke.Win]::FindVisible('TedCat.Card') } 3000
+            Note ("saved card shown: {0}" -f $card)
+            Assert-TedRunning
+        } finally {
+            Stop-RecordFixTedCat
+        }
+    }
+
+    Invoke-Step 'recording-display-change' {
+        $original = [TedCatSmokeRecordFix.Display]::Current()
+        Assert ($null -ne $original) 'EnumDisplaySettings could not read the current display mode'
+        Note ("display mode: {0}; modes offered: {1}" -f $original, ([TedCatSmokeRecordFix.Display]::All() -join '; '))
+        $other = [TedCatSmokeRecordFix.Display]::FindOther($original)
+        if (-not $other) { Skip "the display offers no other resolution than $original" }
+        $test = [TedCatSmokeRecordFix.Display]::Apply($other, $true)
+        if ($test -ne 0) { Skip "Windows would not switch the display to $other (CDS_TEST returned $test)" }
+
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $w = 240; $h = 160
+        $x1 = $canvas[0] + 30; $y1 = $canvas[1] + 30
+        $bounds = [TedCatSmokeRecordFix.Display]::FormBounds([TedCatSmoke.Ui]::Form)
+        $mark = Start-RecordFixTedCat
+        try {
+            $existing = Get-RecordFixVideos
+            Start-RecordFixRecording $x1 $y1 $w $h $mark
+            Start-Sleep -Milliseconds 1500
+            $changed = $false
+            try {
+                $result = [TedCatSmokeRecordFix.Display]::Apply($other, $false)
+                $changed = ($result -eq 0)
+                Note ("switched the display from {0} to {1}: result {2}, screen now {3}" -f $original, $other, $result, [TedCatSmokeRecordFix.Display]::ScreenSize())
+                Assert $changed "ChangeDisplaySettingsEx to $other failed with $result"
+                $interrupted = Wait-Log 'recording interrupted: .*' $mark 15000
+                $detail = Wait-Log 'the display changed from .*' $mark 100
+                Note "log: $(if ($interrupted) { $interrupted } else { '(no interruption within 15 s)' })"
+                if ($detail) { Note "log: $detail" }
+            } finally {
+                # Back to the original mode whatever happened, then the test window where it was.
+                if ($changed -or ([TedCatSmokeRecordFix.Display]::ScreenSize() -ne ('{0}x{1}' -f $original.Width, $original.Height))) {
+                    $back = [TedCatSmokeRecordFix.Display]::Apply($original, $false)
+                    if ($back -ne 0) { $back = [TedCatSmokeRecordFix.Display]::Reset() }
+                    Start-Sleep -Milliseconds 1000
+                    Note ("restored the display to {0}: result {1}, screen now {2}" -f $original, $back, [TedCatSmokeRecordFix.Display]::ScreenSize())
+                }
+                [TedCatSmokeRecordFix.Display]::SetFormBounds([TedCatSmoke.Ui]::Form, $bounds)
+            }
+            Assert ([TedCatSmokeRecordFix.Display]::ScreenSize() -eq ('{0}x{1}' -f $original.Width, $original.Height)) "the display was not restored to $original (now $([TedCatSmokeRecordFix.Display]::ScreenSize()))"
+            Assert ($null -ne $interrupted) 'TedCat did not interrupt the recording when the display resolution changed'
+            Assert ($interrupted -match 'The display resolution changed during the recording') "TedCat interrupted the recording for another reason: $interrupted"
+            $stopLine = Wait-Log 'stopping the recording' $mark 5000
+            Assert ($null -ne $stopLine) 'TedCat did not stop the interrupted recording on its own'
+
+            $file = Wait-RecordFixSaved $mark $existing 'display-change.mp4'
+            $probe = Get-RecordFixProbe $file.FullName
+            if (-not $probe) {
+                Note 'ffprobe not available: stream checks SKIPPED'
+            } else {
+                Note ("ffprobe: video {0} {1}x{2}, duration {3:N2} s" -f $probe.Codec, $probe.Width, $probe.Height, $probe.Duration)
+                Assert ($probe.Codec -eq 'h264') "video codec is $($probe.Codec), expected h264"
+                Assert ($probe.Width -eq $w -and $probe.Height -eq $h) "video is $($probe.Width)x$($probe.Height), expected ${w}x${h}"
+                Assert ($probe.Duration -ge 1.0) "only $($probe.Duration) s were kept of the ~1.5 s recorded before the change"
+            }
+            Assert-TedRunning
+        } finally {
+            Stop-RecordFixTedCat
+        }
+    }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
     $script:Results.Add([pscustomobject]@{ Step = 'script'; Result = 'failed'; Evidence = $_.Exception.Message })

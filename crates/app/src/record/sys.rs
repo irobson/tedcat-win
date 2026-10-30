@@ -3,14 +3,49 @@
 
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use windows::core::PCWSTR;
 use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use super::timing;
-use crate::log_warn;
+use crate::{log_error, log_warn};
+
+/// What recording reports when Media Foundation is missing: Windows N and KN
+/// editions ship without it until the Media Feature Pack is installed.
+const MEDIA_FOUNDATION_MISSING: &str = "Recording needs Windows Media Foundation (install the Media Feature Pack).";
+
+/// The Media Foundation DLLs TedCat calls. TedCat.exe delay-loads them (see
+/// `build.rs`), so it starts without them; nothing may call into them before
+/// `media_foundation_available` succeeded, or the delay-load helper would
+/// raise an exception that ends the process.
+const MEDIA_FOUNDATION_DLLS: [&str; 2] = ["mfplat.dll", "mfreadwrite.dll"];
+
+/// Loads the Media Foundation DLLs from System32 and keeps them loaded for the
+/// life of the process, so the delay-load helper binds to these copies (it
+/// finds a module that is already loaded by name before it searches any
+/// folder). Returns a message for the user when one is missing.
+pub(super) fn media_foundation_available() -> Result<(), String> {
+    static LOADED: AtomicBool = AtomicBool::new(false);
+    if LOADED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    for dll in MEDIA_FOUNDATION_DLLS {
+        let name: Vec<u16> = dll.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `name` is NUL-terminated and outlives the call. The module
+        // handle is deliberately never freed (see above).
+        if let Err(e) = unsafe { LoadLibraryExW(PCWSTR(name.as_ptr()), None, LOAD_LIBRARY_SEARCH_SYSTEM32) } {
+            log_error!("{dll} could not be loaded from System32: {}", describe(&e));
+            return Err(MEDIA_FOUNDATION_MISSING.into());
+        }
+    }
+    LOADED.store(true, Ordering::Release);
+    Ok(())
+}
 
 /// Initializes COM (multithreaded apartment, which is also what WinRT needs)
 /// and optionally Media Foundation for the current thread, and undoes both on
@@ -23,6 +58,9 @@ pub(super) struct MtaScope {
 
 impl MtaScope {
     pub(super) fn enter(media_foundation: bool) -> Result<MtaScope, String> {
+        if media_foundation {
+            media_foundation_available()?;
+        }
         // SAFETY: called at the start of a thread the recorder owns, which has
         // not initialized COM yet; balanced by CoUninitialize in Drop.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -30,7 +68,8 @@ impl MtaScope {
             return Err(format!("COM could not be initialized (0x{:08X})", hr.0 as u32));
         }
         if media_foundation {
-            // SAFETY: MFStartup is reference counted per process; balanced by MFShutdown in Drop.
+            // SAFETY: MFStartup is reference counted per process; balanced by
+            // MFShutdown in Drop. mfplat.dll is loaded (checked above).
             if let Err(e) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
                 // SAFETY: balances the successful CoInitializeEx above.
                 unsafe { CoUninitialize() };
