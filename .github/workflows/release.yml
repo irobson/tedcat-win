@@ -1,0 +1,91 @@
+name: Release
+
+# Push a tag like v0.1.0 to build TedCat.exe on Windows and publish it as a
+# GitHub Release. The tag must match the workspace version in Cargo.toml.
+# Run it manually (Actions > Release > Run workflow) for a dry run that builds
+# and packages without publishing anything.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            if ($tag -ne "v$version") {
+              Write-Error "Tag $tag does not match the workspace version v$version in Cargo.toml."
+              exit 1
+            }
+          }
+          Write-Host "TedCat $version"
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p tedcat
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "dist/TedCat-$v-windows-x64.exe"
+          Copy-Item target/release/TedCat.exe $exe
+          Compress-Archive -Path target/release/TedCat.exe, README.md, LICENSE -DestinationPath "dist/TedCat-$v-windows-x64.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content dist/SHA256SUMS.txt
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload packages (all runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TedCat-${{ steps.version.outputs.version }}-windows-x64
+          path: dist/*
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = @"
+          ## Download
+
+          Get **TedCat-${{ steps.version.outputs.version }}-windows-x64.exe** below and run it. No installer: TedCat lives in the tray (bottom-right, near the clock).
+
+          Windows SmartScreen may warn that the app is unrecognized, because it is not code-signed yet: click **More info**, then **Run anyway**.
+
+          Requires Windows 10 version 2004 or later, or Windows 11, x64 (runs on ARM64 Windows through emulation).
+          "@
+          gh release create $tag dist/* --title "TedCat $tag" --notes $notes --generate-notes --verify-tag
