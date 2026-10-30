@@ -1,0 +1,8 @@
+[package]
+name = "tedcat-core"
+description = "Platform-independent logic for TedCat: the hold gesture, recording decisions, encoding plans and file naming."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
