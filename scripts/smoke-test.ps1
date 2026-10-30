@@ -31,6 +31,13 @@
                     passes straight through (no overlay, no screenshot) and
                     a click still works.
       after-exit    after TedCat is killed, clicks still work.
+      crash-mid-gesture
+                    TedCat killed while a press is held (undecided) and in
+                    the middle of a selection: no overlay is left behind and
+                    the next click works.
+
+    The start step also checks the tray icon and that a second TedCat exits
+    at once (single instance).
 
     The test window tags every button message with GetMessageExtraInfo():
     "TCAT" means TedCat held the event and replayed it, "0x0" means it came
@@ -930,6 +937,39 @@ function Clipboard-HasImage {
     try { return [System.Windows.Forms.Clipboard]::ContainsImage() } catch { return $false }
 }
 
+# Known settings, written before each start (an existing file also means no first-run balloon).
+function Write-Settings {
+    New-Item -ItemType Directory -Force -Path (Split-Path $SettingsPath) | Out-Null
+    [System.IO.File]::WriteAllText($SettingsPath, '{"enabled":true,"trigger":"HoldOnly","hold_millis":350,"play_sounds":false,"include_system_audio":true,"recordings_folder":null}')
+}
+
+function Start-TedCat {
+    $process = Start-Process -FilePath $Exe -PassThru
+    $null = $process.Handle  # keeps ExitCode readable after the process ends
+    return $process
+}
+
+# Windows only drops its yellow capture border for desktop apps when the
+# graphicsCaptureWithoutBorder consent allows it. Returns the values seen and
+# whether a borderless capture is expected.
+function Get-BorderlessConsent {
+    $key = 'Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureWithoutBorder'
+    $read = {
+        param($path)
+        $item = Get-ItemProperty -LiteralPath $path -Name Value -ErrorAction SilentlyContinue
+        if ($item) { return [string]$item.Value }
+        return 'missing'
+    }
+    $values = [ordered]@{
+        'HKCU' = & $read "HKCU:\$key"
+        'HKCU NonPackaged' = & $read "HKCU:\$key\NonPackaged"
+        'HKLM' = & $read "HKLM:\$key"
+    }
+    $expected = $values['HKCU NonPackaged'] -eq 'Allow' -and $values['HKCU'] -ne 'Deny' -and $values['HKLM'] -ne 'Deny'
+    $text = ($values.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, $_.Value }) -join ', '
+    return [pscustomobject]@{ Expected = $expected; Text = $text }
+}
+
 function Find-FFprobe {
     $command = Get-Command ffprobe -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
@@ -983,8 +1023,7 @@ try {
         # Clean slate: no TedCat, no log, settings written so there is no first-run balloon.
         Get-Process -Name TedCat -ErrorAction SilentlyContinue | Stop-Process -Force
         Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Force -Path (Split-Path $SettingsPath) | Out-Null
-        [System.IO.File]::WriteAllText($SettingsPath, '{"enabled":true,"trigger":"HoldOnly","hold_millis":350,"play_sounds":false,"include_system_audio":true,"recordings_folder":null}')
+        Write-Settings
         Note "settings: $(Get-Content -Raw -LiteralPath $SettingsPath)"
 
         $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -1010,7 +1049,7 @@ try {
 
     Invoke-Step 'start' {
         Assert (Test-Path -LiteralPath $Exe) "TedCat.exe not found at $Exe"
-        $script:Ted = Start-Process -FilePath $Exe -PassThru
+        $script:Ted = Start-TedCat
         Note "started TedCat.exe, pid $($script:Ted.Id)"
         $line = Wait-Log 'input hook status: (Active|Unavailable.*)' 0 15000
         if (-not $line) {
@@ -1032,6 +1071,17 @@ try {
         $tray = [TedCatSmoke.Win]::TrayIcon($main, 1)
         Note "tray icon: $tray"
         Assert ($tray.StartsWith('rect=')) "the shell does not know TedCat's tray icon ($tray)"
+
+        # Single instance: a second TedCat must leave at once, so two hooks never hold the same click.
+        $mark = Get-LogMark
+        $second = Start-TedCat
+        $exited = $second.WaitForExit(5000)
+        if (-not $exited) { Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue }
+        $line = Wait-Log 'another TedCat is already running; exiting' $mark 2000
+        Note ("second TedCat (pid {0}) exited: {1}, code {2}; log: {3}" -f $second.Id, $exited, $(if ($exited) { $second.ExitCode } else { '-' }), $(if ($line) { $line } else { '(none)' }))
+        Assert ($exited -and $second.ExitCode -eq 0) 'a second TedCat kept running (or failed) instead of leaving quietly'
+        Assert ($null -ne $line) 'the second TedCat did not log that another one is running'
+        Assert-TedRunning
     }
 
     Invoke-Step 'replay-click' {
@@ -1164,6 +1214,7 @@ try {
         $x2 = $x1 + $w; $y2 = $y1 + $h
         $yellowBefore = 0
         $edgesBefore = [TedCatSmoke.Win]::CaptureBorder([ref]$yellowBefore)
+        $consent = Get-BorderlessConsent
         $mark = Get-LogMark
         $script:overlay = @()
         Invoke-Input ([TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $false)) 'Shift down'
@@ -1195,12 +1246,16 @@ try {
         Save-Desktop 'recording-in-progress'
         $yellowDuring = 0
         $edgesDuring = [TedCatSmoke.Win]::CaptureBorder([ref]$yellowDuring)
-        Note "screen edges before recording: $edgesBefore; while recording: $edgesDuring"
-        $borderLine = Wait-Log 'borderless capture (not granted|unavailable).*|capture border cannot be disabled.*' $mark 100
+        Note "screen edges before recording: $edgesBefore; while recording: $edgesDuring ($yellowDuring of 4 yellow)"
+        $borderLine = Wait-Log 'capture border cannot be disabled.*' $mark 100
         if ($borderLine) {
             Note "TedCat could not turn off the capture border here: $borderLine"
+        } elseif (-not $consent.Expected) {
+            Note "border check not applicable: Windows does not let desktop apps drop the capture border here (consent store: $($consent.Text))"
         } elseif ($yellowDuring -ge 3 -and $yellowBefore -lt 3) {
-            $problems.Add("Windows draws its yellow capture border around the whole screen while recording ($yellowDuring of 4 edges yellow), although TedCat asked for a borderless capture")
+            $problems.Add("Windows draws its yellow capture border around the whole screen while recording ($yellowDuring of 4 edges yellow) although borderless capture is allowed ($($consent.Text))")
+        } else {
+            Note "no capture border while recording (borderless capture allowed: $($consent.Text))"
         }
 
         Start-Sleep -Seconds $RecordSeconds
@@ -1289,6 +1344,44 @@ try {
         Note ('TedCat stopped (exit code 0x{0:X8})' -f $script:Ted.ExitCode)
         if ($script:EnvironmentProblem) { Skip $script:EnvironmentProblem }
         Test-CounterClick 'the click after TedCat exited' $false
+    }
+
+    # The top requirement: a TedCat that dies mid-gesture must leave clicks working.
+    Invoke-Step 'crash-mid-gesture' {
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $x = $canvas[0] + 60; $y = $canvas[1] + 140
+        foreach ($phase in @('pending', 'selecting')) {
+            Write-Settings
+            $mark = Get-LogMark
+            $script:Ted = Start-TedCat
+            Assert ($null -ne (Wait-Log 'input hook status: Active' $mark 15000)) "TedCat did not start again (before the '$phase' crash)"
+            [TedCatSmoke.Ui]::ClearEvents()
+            Invoke-Input ([TedCatSmoke.Input]::Move($x, $y)) 'the move'
+            Start-Sleep -Milliseconds 60
+            Invoke-Input ([TedCatSmoke.Input]::Down($x, $y)) 'the press'
+            $overlay = @()
+            try {
+                if ($phase -eq 'selecting') {
+                    Start-Sleep -Milliseconds 600
+                    Invoke-Input ([TedCatSmoke.Input]::MovePath($x, $y, $x + 200, $y + 120, 10, 15)) 'the drag'
+                    Start-Sleep -Milliseconds 150
+                    $overlay = @(Get-VisibleOverlay)
+                } else {
+                    Start-Sleep -Milliseconds 100  # well inside the 350 ms hold: the press is held, undecided
+                }
+                Stop-Process -Id $script:Ted.Id -Force
+                [void]$script:Ted.WaitForExit(10000)
+                Start-Sleep -Milliseconds 300
+            } finally {
+                [void][TedCatSmoke.Input]::Up($x, $y)
+            }
+            Start-Sleep -Milliseconds 300
+            $left = @(Get-VisibleOverlay)
+            Note ("killed TedCat while the press was {0}: overlay before {1}, after {2}; canvas got '{3}'" -f $phase, $(if ($overlay.Count) { $overlay -join '+' } else { 'none' }), $(if ($left.Count) { $left -join '+' } else { 'none' }), (Get-TaggedSequence 'Canvas'))
+            if ($phase -eq 'selecting') { Assert ('TedCat.Overlay.Dim' -in $overlay) 'the selection never started, so the crash was not mid-selection' }
+            Assert ($left.Count -eq 0) "overlay windows survived TedCat: $($left -join ', ')"
+            Test-CounterClick "the click after TedCat died while the press was $phase" $false
+        }
     }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
