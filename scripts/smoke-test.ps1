@@ -1684,8 +1684,8 @@ namespace TedCatHookSmoke
 
     # The probe's button and key messages in order, as tokens such as
     # "LDOWN+C:TCAT" (+C = MK_CONTROL, +S = MK_SHIFT in wParam) or
-    # "KEYUP(11):0x0" (only for the virtual keys in $Keys). TCAT marks
-    # TedCat's replays, 0x0 events that came straight from this script.
+    # "KEYUP(11):0x0" (only for the generic virtual keys in $Keys). TCAT
+    # marks TedCat's replays, 0x0 events that came straight from this script.
     function Get-ProbeOrder([int[]]$Keys) {
         $tokens = foreach ($e in [TedCatHookSmoke.Probe]::Events()) {
             $f = $e -split ' '
@@ -1697,6 +1697,8 @@ namespace TedCatHookSmoke
                 '{0}{1}:{2}' -f $f[0], $mods, $f[2]
             } elseif ($f[1].StartsWith('vk=')) {
                 $vk = [Convert]::ToInt32($f[1].Substring(3), 16)
+                # Left/right-specific Shift, Ctrl, Alt (VK_LSHIFT..VK_RMENU) as their generic keys.
+                if ($vk -ge 0xA0 -and $vk -le 0xA5) { $vk = 0x10 + [int][Math]::Floor(($vk - 0xA0) / 2) }
                 if ($Keys -contains $vk) { '{0}({1:X2}):{2}' -f $f[0], $vk, $f[2] }
             }
         }

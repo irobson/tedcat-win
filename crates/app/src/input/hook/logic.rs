@@ -7,6 +7,15 @@
 //! it classified events, sends the queued replays with `SendInput`, and
 //! executes the [`Command`]s it emits.
 //!
+//! Modifier keys (Shift, Ctrl, Alt, Win) pressed or released while a press is
+//! held, or while replays are still queued, are swallowed and queued behind
+//! the press, so the app sees them where they physically happened: a click's
+//! `MK_CONTROL` / `MK_SHIFT` and `GetKeyState` come from the key state at that
+//! point of the input stream. A selection swallows the press for good, so
+//! TedCat then injects the unassigned key [`MENU_MASK_VK`] while the modifier
+//! is down; otherwise the app would see a lone Alt or Win tap (menu bar,
+//! KeyTips, Start menu) or a lone Shift tap (IME input mode).
+//!
 //! Every method that can be reached from a hook callback is allocation-light
 //! and never blocks.
 
@@ -49,7 +58,10 @@ pub(super) enum ReplayAction {
     HWheel(i16),
 }
 
-/// One event to re-inject, at a point in physical pixels of the virtual screen.
+/// One mouse event to re-inject, at a point in physical pixels of the virtual screen.
+///
+/// Buttons are logical (primary / secondary, as the hook reports them); the
+/// hook thread converts them to the physical buttons `SendInput` expects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ReplayEvent {
     pub point: PointPx,
@@ -59,6 +71,48 @@ pub(super) struct ReplayEvent {
 impl ReplayEvent {
     pub fn new(point: PointPx, action: ReplayAction) -> Self {
         Self { point, action }
+    }
+}
+
+/// The unassigned virtual key TedCat injects so the release of a modifier
+/// whose click was swallowed is not a lone tap (the "menu mask" key; 0xE8 is
+/// unassigned, produces no character and has no default action).
+pub(super) const MENU_MASK_VK: u16 = 0xE8;
+
+/// One keyboard event to re-inject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct KeyStroke {
+    /// Virtual key as the hook reported it (`VK_LCONTROL`, `VK_SHIFT`, ...).
+    pub vk: u16,
+    pub scan: u16,
+    /// `LLKHF_EXTENDED` was set (right Ctrl / Alt, the Win keys).
+    pub extended: bool,
+    pub up: bool,
+}
+
+impl KeyStroke {
+    /// The [`MENU_MASK_VK`] key going down (`up` false) or up.
+    pub const fn mask(up: bool) -> Self {
+        Self { vk: MENU_MASK_VK, scan: 0, extended: false, up }
+    }
+
+    /// True for the menu mask key TedCat adds itself (not one of the user's keys).
+    pub const fn is_mask(&self) -> bool {
+        self.vk == MENU_MASK_VK
+    }
+}
+
+/// One event of the replay queue, injected in queue order with one `SendInput` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Replay {
+    Mouse(ReplayEvent),
+    Key(KeyStroke),
+}
+
+impl Replay {
+    /// A key of the user (not the mask key) that must keep its place in the stream.
+    fn is_user_key(&self) -> bool {
+        matches!(self, Replay::Key(key) if !key.is_mask())
     }
 }
 
@@ -124,8 +178,15 @@ pub(super) struct HookLogic {
     /// The swallowed left-down, kept from `Hold` until it is replayed, consumed
     /// by a commit or cancel, or dropped.
     held: Option<PointPx>,
+    /// Modifier keys swallowed while the press is pending, in order. They go
+    /// out right behind the held press, or on their own when the press turns
+    /// into a selection or is dropped.
+    held_keys: Vec<KeyStroke>,
+    /// A modifier was down at the held press and no mask key has been queued
+    /// since (Alt and Win get one at the hold itself).
+    mask_owed: bool,
     hold_timer_armed: bool,
-    replays: Vec<ReplayEvent>,
+    replays: Vec<Replay>,
     escape: EscapeTracker,
     commands: Vec<Command>,
 }
@@ -141,6 +202,8 @@ impl HookLogic {
         Self {
             recognizer: HoldGestureRecognizer::default(),
             held: None,
+            held_keys: Vec::new(),
+            mask_owed: false,
             hold_timer_armed: false,
             replays: Vec::new(),
             escape: EscapeTracker::default(),
@@ -164,7 +227,7 @@ impl HookLogic {
     }
 
     /// Takes the queued replays, in the order they must be injected.
-    pub fn take_replays(&mut self) -> Vec<ReplayEvent> {
+    pub fn take_replays(&mut self) -> Vec<Replay> {
         std::mem::take(&mut self.replays)
     }
 
@@ -190,7 +253,19 @@ impl HookLogic {
         } else {
             Verdict::Pass
         };
-        self.finish(verdict, ReplayEvent::new(point, ReplayAction::LeftDown))
+        let swallow = self.finish(verdict, ReplayEvent::new(point, ReplayAction::LeftDown));
+        if verdict == Verdict::Hold {
+            // Alt or Win down at a press TedCat may swallow for good: mask them
+            // right away, while they are certainly still down. Masking a press
+            // that is later replayed as a normal click is harmless. Shift and
+            // Ctrl only get their mask once a selection begins.
+            let menu_keys = ctx.modifiers.contains(Modifiers::ALT) || ctx.modifiers.contains(Modifiers::WIN);
+            if menu_keys {
+                self.enqueue_mask();
+            }
+            self.mask_owed = !menu_keys && !ctx.modifiers.is_empty();
+        }
+        swallow
     }
 
     /// Left button released. Returns true when the event must be swallowed.
@@ -216,7 +291,7 @@ impl HookLogic {
             // A normal drag: give the app the press at its original point, then
             // bring the pointer back to where it is now.
             self.release_held();
-            self.enqueue(ReplayEvent::new(point, ReplayAction::Move));
+            self.enqueue(Replay::Mouse(ReplayEvent::new(point, ReplayAction::Move)));
         }
     }
 
@@ -225,6 +300,34 @@ impl HookLogic {
     /// event in the order it happened.
     pub fn other_button(&mut self, event: ReplayEvent) -> bool {
         self.defer_while_replaying(event)
+    }
+
+    /// A modifier key (Shift, Ctrl, Alt or Win, see [`is_modifier_vk`]) went
+    /// down or up. Returns true when the event must be swallowed: it is then
+    /// queued and replayed in its physical place, behind the held press (or
+    /// behind the replays still queued).
+    ///
+    /// `foreground_accepts` says whether replayed keys can reach the
+    /// foreground window (UIPI drops input injected into a more privileged
+    /// process, which could leave a modifier stuck down). It is asked only
+    /// when the key would be queued and no key of the user is queued yet;
+    /// once one is, every later modifier is queued too, so a press and its
+    /// release can never swap places.
+    pub fn modifier_key(&mut self, key: KeyStroke, foreground_accepts: impl FnOnce() -> bool) -> bool {
+        let pending = self.held.is_some() && matches!(self.recognizer.state(), State::Pending { .. });
+        if !pending && self.replays.is_empty() {
+            return false;
+        }
+        let keys_queued = !self.held_keys.is_empty() || self.replays.iter().any(Replay::is_user_key);
+        if !keys_queued && !foreground_accepts() {
+            return false;
+        }
+        if pending {
+            self.held_keys.push(key);
+        } else {
+            self.enqueue(Replay::Key(key));
+        }
+        true
     }
 
     /// Escape key down (`down`) or up. Returns true when the key event must be swallowed.
@@ -307,16 +410,26 @@ impl HookLogic {
         self.abandon(false);
     }
 
-    /// The hook thread is stopping: drop everything.
+    /// The hook thread is stopping: drop every mouse replay and the held press,
+    /// but keep the swallowed keys (the caller sends them one last time), so
+    /// no modifier is left down.
     pub fn shutdown(&mut self) {
-        self.replays.clear();
+        self.replays.retain(|replay| matches!(replay, Replay::Key(_)));
         self.abandon(false);
     }
 
-    /// A bug (panic) inside the hook logic: stop holding presses.
+    /// A bug (panic) inside the hook logic: stop holding presses. Swallowed
+    /// keys are still delivered, so no modifier is left down.
     pub fn internal_failure(&mut self) {
-        self.replays.clear();
+        self.replays.retain(|replay| matches!(replay, Replay::Key(_)));
+        for key in std::mem::take(&mut self.held_keys) {
+            self.replays.push(Replay::Key(key));
+        }
+        if !self.replays.is_empty() {
+            self.commands.push(Command::Wake);
+        }
         self.held = None;
+        self.mask_owed = false;
         self.recognizer.reset();
         self.hold_timer_armed = false;
         self.commands.push(Command::DisarmHoldTimer);
@@ -352,6 +465,8 @@ impl HookLogic {
             _ => {}
         }
         self.held = None;
+        // The keys are real input even when the press is dropped.
+        self.flush_held_keys_without_press();
         self.disarm_hold_timer();
         self.recognizer.reset();
     }
@@ -366,7 +481,7 @@ impl HookLogic {
             }
             Verdict::Release => {
                 self.release_held();
-                self.enqueue(current);
+                self.enqueue(Replay::Mouse(current));
                 true
             }
         }
@@ -376,22 +491,57 @@ impl HookLogic {
         if self.replays.is_empty() {
             false
         } else {
-            self.enqueue(event);
+            self.enqueue(Replay::Mouse(event));
             true
         }
     }
 
+    /// Queues the held press, then the keys swallowed while it was held.
     fn release_held(&mut self) {
         if let Some(point) = self.held.take() {
-            self.enqueue(ReplayEvent::new(point, ReplayAction::LeftDown));
+            self.enqueue(Replay::Mouse(ReplayEvent::new(point, ReplayAction::LeftDown)));
+        }
+        self.mask_owed = false;
+        let mut keys = std::mem::take(&mut self.held_keys);
+        for key in keys.drain(..) {
+            self.enqueue(Replay::Key(key));
+        }
+        self.held_keys = keys;
+    }
+
+    /// Queues the keys swallowed while the press was held when the press
+    /// itself never reaches the app (a selection began, or it was dropped).
+    /// No click separates those modifiers' presses from their releases any
+    /// more, so a mask key goes between each press and the release after it,
+    /// and at the end while one is still down.
+    fn flush_held_keys_without_press(&mut self) {
+        let mut owed = std::mem::take(&mut self.mask_owed);
+        let mut keys = std::mem::take(&mut self.held_keys);
+        for key in keys.drain(..) {
+            if key.up && owed {
+                self.enqueue_mask();
+                owed = false;
+            }
+            self.enqueue(Replay::Key(key));
+            owed |= !key.up;
+        }
+        self.held_keys = keys;
+        if owed {
+            self.enqueue_mask();
         }
     }
 
-    fn enqueue(&mut self, event: ReplayEvent) {
+    /// Queues the menu mask key, down then up.
+    fn enqueue_mask(&mut self) {
+        self.enqueue(Replay::Key(KeyStroke::mask(false)));
+        self.enqueue(Replay::Key(KeyStroke::mask(true)));
+    }
+
+    fn enqueue(&mut self, replay: Replay) {
         if self.replays.is_empty() {
             self.commands.push(Command::Wake);
         }
-        self.replays.push(event);
+        self.replays.push(replay);
     }
 
     fn disarm_hold_timer(&mut self) {
@@ -415,6 +565,9 @@ impl HookLogic {
                 Effect::DisarmTimer => self.disarm_hold_timer(),
                 Effect::BeginSelection { origin, mode } => {
                     self.commands.push(Command::Gesture(GestureEvent::Begin { origin: point_px(origin), mode }));
+                    // The press stays held (for `begin_failed`) but will not be
+                    // replayed: deliver the keys swallowed so far now.
+                    self.flush_held_keys_without_press();
                 }
                 Effect::UpdateSelection(rect) => {
                     self.commands.push(Command::Gesture(GestureEvent::Update(RectPx::from_core(rect))));
@@ -563,6 +716,25 @@ pub(super) fn may_hold_over(
     matches!(integrity, Some(level) if level <= own_integrity)
 }
 
+/// Whether keys swallowed while a press is held may be queued for replay,
+/// given the process `pid` owning the foreground window.
+///
+/// Our own process always can; any other must have a known integrity level
+/// no higher than ours, because UIPI silently drops input injected into a
+/// more privileged process and a dropped key-up leaves a modifier stuck.
+pub(super) fn may_queue_keys_for(pid: u32, integrity: Option<u32>, own_pid: u32, own_integrity: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    pid == own_pid || matches!(integrity, Some(level) if level <= own_integrity)
+}
+
+/// True for the virtual keys of Shift, Ctrl, Alt and Win, generic or
+/// left/right (`VK_SHIFT`..`VK_MENU`, `VK_LWIN`, `VK_RWIN`, `VK_LSHIFT`..`VK_RMENU`).
+pub(super) fn is_modifier_vk(vk: u32) -> bool {
+    matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
 /// True when a UTF-16 window class name starts with `prefix`.
 pub(super) fn class_has_prefix(class_name: &[u16], prefix: &str) -> bool {
     let mut name = class_name.iter().copied().take_while(|&c| c != 0);
@@ -640,12 +812,37 @@ mod tests {
             .collect()
     }
 
-    fn down(point: PointPx) -> ReplayEvent {
-        ReplayEvent::new(point, ReplayAction::LeftDown)
+    fn down(point: PointPx) -> Replay {
+        Replay::Mouse(ReplayEvent::new(point, ReplayAction::LeftDown))
     }
 
-    fn up(point: PointPx) -> ReplayEvent {
-        ReplayEvent::new(point, ReplayAction::LeftUp)
+    fn up(point: PointPx) -> Replay {
+        Replay::Mouse(ReplayEvent::new(point, ReplayAction::LeftUp))
+    }
+
+    /// Left Ctrl as the low-level hook reports it.
+    fn ctrl(up: bool) -> KeyStroke {
+        KeyStroke { vk: 0xA2, scan: 0x1D, extended: false, up }
+    }
+
+    fn shift(up: bool) -> KeyStroke {
+        KeyStroke { vk: 0xA0, scan: 0x2A, extended: false, up }
+    }
+
+    fn key(stroke: KeyStroke) -> Replay {
+        Replay::Key(stroke)
+    }
+
+    fn mask() -> [Replay; 2] {
+        [Replay::Key(KeyStroke::mask(false)), Replay::Key(KeyStroke::mask(true))]
+    }
+
+    fn accepts() -> bool {
+        true
+    }
+
+    fn refuses() -> bool {
+        false
     }
 
     #[test]
@@ -669,7 +866,7 @@ mod tests {
         assert!(!logic.has_queued_replays());
         let far = PointPx::new(120, 100);
         logic.moved(far);
-        assert_eq!(logic.take_replays(), vec![down(ORIGIN), ReplayEvent::new(far, ReplayAction::Move)]);
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), Replay::Mouse(ReplayEvent::new(far, ReplayAction::Move))]);
         assert_eq!(commands(&mut logic), vec![Command::DisarmHoldTimer, Command::Wake]);
         // The rest of the drag flows untouched.
         logic.moved(PointPx::new(150, 100));
@@ -758,7 +955,10 @@ mod tests {
         let second = PointPx::new(200, 200);
         assert!(logic.left_down(second, &PressContext { enabled: false, ..ctx() }));
         assert!(logic.left_up(second));
-        assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN), right, down(second), up(second)]);
+        assert_eq!(
+            logic.take_replays(),
+            vec![down(ORIGIN), up(ORIGIN), Replay::Mouse(right), down(second), up(second)]
+        );
         // Once sent, other buttons pass straight through again.
         assert!(!logic.other_button(right));
     }
@@ -771,6 +971,236 @@ mod tests {
         assert!(logic.left_down(ORIGIN, &ctx()));
         assert!(logic.left_up(ORIGIN));
         assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN), down(ORIGIN), up(ORIGIN)]);
+    }
+
+    #[test]
+    fn a_modifier_released_while_the_press_is_held_follows_the_press() {
+        let mut logic = HookLogic::new();
+        // Ctrl went down before the press: nothing is held, so it passes.
+        assert!(!logic.modifier_key(ctrl(false), || panic!("nothing is held: no need to ask")));
+        assert!(logic.left_down(ORIGIN, &PressContext { modifiers: Modifiers::CONTROL, ..ctx() }));
+        assert!(logic.modifier_key(ctrl(true), accepts), "a Ctrl-up while the press is held is swallowed");
+        assert!(!logic.has_queued_replays(), "nothing is sent before the press is decided");
+        assert!(logic.left_up(ORIGIN));
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(ctrl(true)), up(ORIGIN)]);
+        // Once sent, modifiers pass straight through again.
+        assert!(!logic.modifier_key(ctrl(false), || panic!("nothing is queued: no need to ask")));
+    }
+
+    #[test]
+    fn a_modifier_pressed_while_the_press_is_held_comes_after_it() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        assert!(logic.modifier_key(shift(false), accepts));
+        assert!(logic.left_up(ORIGIN));
+        // The Shift-up arrives before the loop sent the replay: it waits behind it.
+        assert!(logic.modifier_key(shift(true), || panic!("a key of the user is already queued")));
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(shift(false)), up(ORIGIN), key(shift(true))]);
+    }
+
+    #[test]
+    fn a_drag_replays_the_swallowed_keys_behind_the_press() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        assert!(logic.modifier_key(ctrl(false), accepts));
+        let far = PointPx::new(120, 100);
+        logic.moved(far);
+        assert_eq!(
+            logic.take_replays(),
+            vec![down(ORIGIN), key(ctrl(false)), Replay::Mouse(ReplayEvent::new(far, ReplayAction::Move))]
+        );
+    }
+
+    #[test]
+    fn modifiers_pass_when_the_foreground_cannot_take_replayed_keys() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        assert!(!logic.modifier_key(ctrl(false), refuses));
+        assert!(!logic.modifier_key(ctrl(true), refuses));
+        logic.left_up(ORIGIN);
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN)]);
+    }
+
+    #[test]
+    fn once_a_key_is_queued_the_next_ones_follow_it_without_asking() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        assert!(logic.modifier_key(ctrl(false), accepts));
+        // Even if the foreground changed meanwhile, the release must not overtake the press.
+        assert!(logic.modifier_key(ctrl(true), refuses));
+        logic.left_up(ORIGIN);
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(ctrl(false)), key(ctrl(true)), up(ORIGIN)]);
+    }
+
+    #[test]
+    fn modifiers_behind_a_queued_replay_are_queued() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.left_up(ORIGIN);
+        assert!(logic.modifier_key(ctrl(false), accepts));
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), up(ORIGIN), key(ctrl(false))]);
+    }
+
+    #[test]
+    fn modifiers_are_not_queued_during_a_selection() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.hold_timeout(true);
+        assert!(logic.take_replays().is_empty());
+        assert!(!logic.modifier_key(ctrl(false), || panic!("nothing to queue behind: no need to ask")));
+    }
+
+    #[test]
+    fn keys_swallowed_before_a_selection_are_delivered_when_it_begins() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        assert!(logic.modifier_key(ctrl(false), accepts));
+        commands(&mut logic);
+        logic.hold_timeout(true);
+        assert!(commands(&mut logic).contains(&Command::Wake));
+        // Ctrl is down and the press never reaches the app: masked after the Ctrl-down.
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![key(ctrl(false)), mask_down, mask_up]);
+        assert!(logic.left_up(PointPx::new(300, 300)));
+        assert!(logic.take_replays().is_empty(), "the committed press is not replayed");
+    }
+
+    #[test]
+    fn a_tap_while_the_press_is_held_gets_a_mask_between_press_and_release() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.modifier_key(ctrl(false), accepts);
+        logic.modifier_key(ctrl(true), accepts);
+        logic.hold_timeout(true);
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![key(ctrl(false)), mask_down, mask_up, key(ctrl(true))]);
+    }
+
+    #[test]
+    fn shift_or_ctrl_at_the_press_are_masked_once_a_selection_begins() {
+        for modifiers in [Modifiers::SHIFT, Modifiers::CONTROL] {
+            let mut logic = HookLogic::new();
+            assert!(logic.left_down(ORIGIN, &PressContext { modifiers, ..ctx() }));
+            assert!(!logic.has_queued_replays(), "no mask while the press may still be a click");
+            logic.hold_timeout(true);
+            assert_eq!(logic.take_replays(), mask().to_vec(), "{modifiers:?}");
+        }
+        // Released before the selection began: the mask goes before the release.
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &PressContext { modifiers: Modifiers::CONTROL, ..ctx() });
+        logic.modifier_key(ctrl(true), accepts);
+        logic.hold_timeout(true);
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![mask_down, mask_up, key(ctrl(true))]);
+    }
+
+    #[test]
+    fn alt_and_win_are_masked_at_the_hold() {
+        for modifiers in [Modifiers::ALT, Modifiers::WIN, Modifiers::ALT | Modifiers::SHIFT] {
+            let mut logic = HookLogic::new();
+            assert!(logic.left_down(ORIGIN, &PressContext { modifiers, ..ctx() }));
+            assert!(commands(&mut logic).contains(&Command::Wake));
+            assert_eq!(logic.take_replays(), mask().to_vec(), "{modifiers:?}");
+            // The selection adds no second mask, and the commit replays nothing.
+            logic.hold_timeout(true);
+            assert!(logic.take_replays().is_empty());
+            assert!(logic.left_up(PointPx::new(300, 300)));
+            assert!(logic.take_replays().is_empty());
+        }
+        // A press without modifiers is never masked.
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.hold_timeout(true);
+        logic.left_up(PointPx::new(300, 300));
+        assert!(logic.take_replays().is_empty());
+    }
+
+    #[test]
+    fn a_quick_click_after_the_mask_is_replayed_behind_it() {
+        let mut logic = HookLogic::new();
+        let win = PressContext { modifiers: Modifiers::WIN, required: Modifiers::WIN, ..ctx() };
+        assert!(logic.left_down(ORIGIN, &win));
+        assert!(logic.left_up(ORIGIN));
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![mask_down, mask_up, down(ORIGIN), up(ORIGIN)]);
+    }
+
+    #[test]
+    fn the_mask_does_not_pull_later_keys_into_the_queue() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &PressContext { modifiers: Modifiers::ALT, ..ctx() });
+        assert!(logic.has_queued_replays());
+        // An elevated foreground: the Alt-up passes instead of waiting behind the mask.
+        let alt_up = KeyStroke { vk: 0xA4, scan: 0x38, extended: false, up: true };
+        assert!(!logic.modifier_key(alt_up, refuses));
+    }
+
+    #[test]
+    fn a_dropped_press_still_delivers_the_swallowed_keys() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &PressContext { modifiers: Modifiers::CONTROL, ..ctx() });
+        logic.modifier_key(ctrl(true), accepts);
+        logic.hooks_reset();
+        let [mask_down, mask_up] = mask();
+        assert_eq!(logic.take_replays(), vec![mask_down, mask_up, key(ctrl(true))]);
+        assert!(logic.is_idle());
+    }
+
+    #[test]
+    fn the_kill_switch_gives_back_the_press_with_its_keys() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.modifier_key(ctrl(false), accepts);
+        for t in [0u32, 100, 200] {
+            logic.escape(true, t);
+            logic.escape(false, t + 10);
+        }
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), key(ctrl(false))]);
+        assert!(logic.is_idle());
+    }
+
+    #[test]
+    fn shutdown_and_internal_failures_keep_the_swallowed_keys() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.left_up(ORIGIN);
+        // A second press is held behind the queued click, with a key behind it.
+        assert!(logic.left_down(ORIGIN, &ctx()));
+        assert!(logic.modifier_key(ctrl(true), accepts));
+        logic.shutdown();
+        assert_eq!(logic.take_replays(), vec![key(ctrl(true))], "mouse replays are dropped, keys are not");
+
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.modifier_key(ctrl(false), accepts);
+        commands(&mut logic);
+        logic.internal_failure();
+        assert!(commands(&mut logic).contains(&Command::Wake));
+        assert_eq!(logic.take_replays(), vec![key(ctrl(false))]);
+        assert!(logic.is_idle());
+    }
+
+    #[test]
+    fn modifier_virtual_keys() {
+        for vk in [0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
+            assert!(is_modifier_vk(vk), "{vk:#x}");
+        }
+        for vk in [0x1B, 0x14, 0x5D, 0x41, 0xE8, 0x09] {
+            assert!(!is_modifier_vk(vk), "{vk:#x}");
+        }
+        assert!(KeyStroke::mask(false).is_mask() && !ctrl(false).is_mask());
+    }
+
+    #[test]
+    fn keys_are_queued_only_for_a_foreground_that_can_take_them() {
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
+        assert!(may_queue_keys_for(10, Some(MEDIUM), 1, MEDIUM));
+        assert!(!may_queue_keys_for(10, Some(HIGH), 1, MEDIUM), "UIPI would drop the replayed keys");
+        assert!(!may_queue_keys_for(10, None, 1, MEDIUM), "unknown integrity counts as elevated");
+        assert!(!may_queue_keys_for(0, Some(MEDIUM), 1, MEDIUM), "no foreground window");
+        assert!(may_queue_keys_for(1, None, 1, MEDIUM), "our own windows always can");
+        assert!(may_queue_keys_for(10, Some(HIGH), 1, HIGH));
     }
 
     #[test]
