@@ -36,6 +36,25 @@
                     the middle of a selection: no overlay is left behind and
                     the next click works.
 
+    Self-contained sections follow (each starts its own TedCat and undoes
+    what it changes; details above each one):
+
+      recording-delay-load, recording-downscale, recording-display-change
+                    Media Foundation is delay-loaded; a region over the
+                    encoder limit is scaled down; a resolution change ends a
+                    recording cleanly with a readable notice.
+      foreign-app-messages, quit-while-saving, session-end-saves-recording,
+      session-end-during-quit, selection-at-quit
+                    junk WM_APP posts are ignored; quitting and the end of the
+                    session finalize the recording, never hold presses while
+                    they wait, and hand a selection's press back to the app.
+      hook-swapped-buttons, hook-modifier-order, hook-other-input-order,
+      hook-menu-key-mask
+                    left-handed buttons; modifiers, keys and wheels keep their
+                    physical order around a held press; Alt/Win + hold never
+                    leaves a lone Alt or Win tap.
+      user-messages every balloon of the run reads as whole sentences.
+
     The start step also checks the tray icon and that a second TedCat exits
     at once (single instance).
 
@@ -1803,6 +1822,10 @@ namespace TedCatSmokeRecordFix
             Assert ([TedCatSmokeRecordFix.Display]::ScreenSize() -eq ('{0}x{1}' -f $original.Width, $original.Height)) "the display was not restored to $original (now $([TedCatSmokeRecordFix.Display]::ScreenSize()))"
             Assert ($null -ne $interrupted) 'TedCat did not interrupt the recording when the display resolution changed'
             Assert ($interrupted -match 'The display resolution changed during the recording') "TedCat interrupted the recording for another reason: $interrupted"
+            # What the user reads: the reason, then TedCat's own sentence, one period each.
+            $notice = Wait-Log 'notice: Recording stopped: .*' $mark 3000
+            Note "log: $(if ($notice) { $notice } else { '(no notice)' })"
+            Assert ($notice -match 'notice: Recording stopped: The display resolution changed during the recording\. TedCat saves what was captured\.$') "the interruption notice is not 'The display resolution changed during the recording. TedCat saves what was captured.': $notice"
             $stopLine = Wait-Log 'stopping the recording' $mark 5000
             Assert ($null -ne $stopLine) 'TedCat did not stop the interrupted recording on its own'
 
@@ -1843,6 +1866,9 @@ namespace TedCatSmokeRecordFix
     #                               like Windows does) the MP4 is complete.
     #   session-end-during-quit     a WM_ENDSESSION that arrives while a quit
     #                               is still saving waits for that save.
+    #   selection-at-quit           Quit, or the end of the session, with a
+    #                               selection on screen closes the overlay and
+    #                               hands the held press back to the app.
 
     $uiFixHelpers = @'
 using System;
@@ -2290,9 +2316,71 @@ namespace TedCatSmokeUiFix
         Assert-UiFixMp4Complete $path 'when WM_ENDSESSION returned during the quit'
     }
 
+    # Quit, and the end of the session, while a selection is on screen: the
+    # selection is never committed, so the overlay closes and the held press
+    # goes back to the app (as when the overlay cannot be shown): the knob
+    # gets TedCat's replayed press at the press point plus a move to where the
+    # pointer is, then the real release, and follows the drag.
+    Invoke-Step 'selection-at-quit' {
+        $dx = 150
+        foreach ($how in @('quit', 'session end')) {
+            $main = Start-UiFixTedCat "selection-at-quit ($how)"
+            [TedCatSmoke.Ui]::ResetKnob()
+            Start-Sleep -Milliseconds 200
+            [TedCatSmoke.Ui]::ClearEvents()
+            $before = [TedCatSmoke.Ui]::Rect('Knob')
+            $a = Center $before
+            $mark = Get-LogMark
+            $overlay = @(); $left = @(); $end = $null
+            Invoke-Input ([TedCatSmoke.Input]::Move($a[0], $a[1])) 'the move to the knob'
+            Start-Sleep -Milliseconds 60
+            Invoke-Input ([TedCatSmoke.Input]::Down($a[0], $a[1])) 'the press on the knob'
+            try {
+                Start-Sleep -Milliseconds 700   # past the 350 ms hold: a selection
+                Invoke-Input ([TedCatSmoke.Input]::MovePath($a[0], $a[1], $a[0] + $dx, $a[1], 15, 15)) 'the drag'
+                Start-Sleep -Milliseconds 200
+                $overlay = @(Get-VisibleOverlay)
+                if ($how -eq 'quit') {
+                    $err = [TedCatSmokeUiFix.Session]::Post($main, $WM_CLOSE, 0, 0)
+                    Assert ($null -eq $err) "posting WM_CLOSE failed: $err"
+                } else {
+                    $query = [TedCatSmokeUiFix.Session]::Send($main, $WM_QUERYENDSESSION, 0, $ENDSESSION_LOGOFF, 10000)
+                    Assert ($query.Ok -and $query.Result -eq 1) "TedCat did not answer WM_QUERYENDSESSION with TRUE ($query)"
+                    $end = [TedCatSmokeUiFix.Session]::SendAsync($main, $WM_ENDSESSION, 1, $ENDSESSION_LOGOFF, 20000)
+                }
+                $refused = Wait-Log 'no selection overlay for the press at .*' $mark 5000
+                [void](Wait-Until { @(Get-VisibleOverlay).Count -eq 0 } 3000)
+                $left = @(Get-VisibleOverlay)
+                Start-Sleep -Milliseconds 300
+            } finally {
+                if (-not [TedCatSmoke.Input]::Up($a[0] + $dx, $a[1])) { Write-Host "    (release failed: $([TedCatSmoke.Input]::LastError))" }
+            }
+            if ($end) { [void]$end.Wait(25000) }
+            $exited = $script:Ted.WaitForExit(15000)
+            if (-not $exited) { Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Milliseconds 300
+            # Written by the hook's logger thread, which may not get to it before the process ends.
+            $handedBack = Wait-Log '\[input\] The UI did not show the selection; the press was passed through\.' $mark 100
+            $after = [TedCatSmoke.Ui]::Rect('Knob')
+            $moved = $after[0] - $before[0]
+            $tagged = Get-TaggedSequence 'Knob'
+            Note ("{0} during a selection: overlay before [{1}], after [{2}]; knob got '{3}', moved {4} px (expected {5}); TedCat exited: {6}{7}" -f $how, ($overlay -join ', '), ($left -join ', '), $tagged, $moved, $dx, $exited, $(if ($end) { "; WM_ENDSESSION: $end" } else { '' }))
+            Note "log: $(if ($refused) { $refused } else { '(no hand-back request)' }); $(if ($handedBack) { $handedBack } else { '(the hook did not hand the press back)' })"
+            Assert ('TedCat.Overlay.Dim' -in $overlay) "the selection never started, so there was no overlay at the $how"
+            Assert ($left.Count -eq 0) "the overlay stayed on screen after the ${how}: $($left -join ', ')"
+            Assert ($null -ne $refused) "the $how did not ask the hook to hand the held press back to the app"
+            Assert ($tagged -eq 'DOWN:TCAT UP:0x0') "after the $how the knob must get TedCat's replayed press and the real release (expected 'DOWN:TCAT UP:0x0'), got '$tagged'"
+            Assert ([Math]::Abs($moved - $dx) -le 3) "the knob did not follow the drag after the $how (moved $moved px instead of $dx)"
+            Assert $exited "TedCat did not exit after the $how"
+            if ($end) { Assert $end.Ok "WM_ENDSESSION did not return ($end)" }
+        }
+        [TedCatSmoke.Ui]::ResetKnob()
+    }
+
     # -----------------------------------------------------------------------
-    # Input hook: swapped mouse buttons, modifier keys kept in order with a
-    # held press, and the menu mask key after Alt/Win + hold
+    # Input hook: swapped mouse buttons, modifier keys (and the keys, wheel
+    # notches and buttons after them) kept in order with a held press, and
+    # the menu mask key after Alt/Win + hold
     # (crates/app/src/input/hook.rs, hook/logic.rs).
     #
     # Self-contained: its own probe window (a TopMost form with no child
@@ -2380,6 +2468,14 @@ namespace TedCatHookSmoke
         public static bool Move(int x, int y) { return One(Mouse(x, y, 0)); }
         public static bool Button(int x, int y, uint flags) { return One(Mouse(x, y, flags)); }
 
+        /// One wheel notch of `delta` (120 = away from the user) at (x, y).
+        public static bool Wheel(int x, int y, int delta)
+        {
+            N.INPUT input = Mouse(x, y, 0x0800);
+            input.u.mi.mouseData = unchecked((uint)delta);
+            return One(input);
+        }
+
         public static bool Key(ushort vk, ushort scan, bool up, bool extended)
         {
             N.INPUT input = new N.INPUT();
@@ -2409,9 +2505,9 @@ namespace TedCatHookSmoke
         }
     }
 
-    /// Logs "KIND detail TAG": button messages with "mk=<wParam MK_* flags>",
-    /// key messages with "vk=<virtual key>", WM_SYSCOMMAND with "sc=..", and
-    /// WM_ENTERMENULOOP. TAG is "TCAT" for TedCat's replays.
+    /// Logs "KIND detail TAG": button and wheel messages with "mk=<wParam MK_*
+    /// flags>", key messages with "vk=<virtual key>", WM_SYSCOMMAND with
+    /// "sc=..", and WM_ENTERMENULOOP. TAG is "TCAT" for TedCat's replays.
     public class ProbeForm : Form
     {
         static string Kind(int msg)
@@ -2428,6 +2524,7 @@ namespace TedCatHookSmoke
                 case 0x204: return "RDOWN";
                 case 0x205: return "RUP";
                 case 0x206: return "RDBL";
+                case 0x20A: return "WHEEL";
             }
             return null;
         }
@@ -2745,6 +2842,73 @@ namespace TedCatHookSmoke
         }
     }
 
+    # Any other key, a wheel notch or another button while a modifier waits
+    # behind the held press must not overtake it: TedCat ends the hold (as a
+    # drag would) and replays press, modifier and that event in their
+    # physical order. Nothing is eaten: the release and later keys reach the
+    # app too, and no screenshot is taken.
+    Invoke-Step 'hook-other-input-order' {
+        $c = $null
+        try {
+            $c = Initialize-HookProbe
+            Start-HookTedCat 'HoldOnly'
+            Set-ProbeForeground $c
+            $left = [TedCatHookSmoke.Send]::LeftDown; $leftUp = [TedCatHookSmoke.Send]::LeftUp
+            $mark = Get-LogMark
+
+            # Press, Ctrl down, A tapped, Ctrl up, release (a Ctrl+A typed while the button is down).
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Move($c[0], $c[1])) 'the move'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $left)) 'the press'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x11, 0x1D, $false, $false)) 'Ctrl down'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x41, 0x1E, $false, $false)) 'A down'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x41, 0x1E, $true, $false)) 'A up'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x11, 0x1D, $true, $false)) 'Ctrl up'
+            # Well past the 350 ms hold: a hold still in force shows the overlay by now.
+            Start-Sleep -Milliseconds 450
+            $overlay = @(Get-VisibleOverlay)
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $leftUp)) 'the release'
+            Start-Sleep -Milliseconds 700
+            $typed = Get-ProbeOrder @(0x11, 0x41)
+            Note "press, Ctrl down, A down/up, Ctrl up, release: probe got '$typed'"
+            # The first three are TedCat's ordered replay; what follows came after the replay was sent.
+            Assert ($typed -match '^LDOWN:TCAT KEYDOWN\(11\):TCAT KEYDOWN\(41\):TCAT KEYUP\(41\):(TCAT|0x0) KEYUP\(11\):(TCAT|0x0) LUP:(TCAT|0x0)$') "the A must follow the held press and the Ctrl press in their physical order, and nothing may be lost (expected 'LDOWN:TCAT KEYDOWN(11):TCAT KEYDOWN(41):TCAT KEYUP(41) KEYUP(11) LUP'), got '$typed'"
+
+            # Press, Shift down, one wheel notch, Shift up, release.
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $left)) 'the press'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $false, $false)) 'Shift down'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Wheel($c[0], $c[1], -120)) 'the wheel notch'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $true, $false)) 'Shift up'
+            Start-Sleep -Milliseconds 450
+            $overlay += @(Get-VisibleOverlay)
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $leftUp)) 'the release'
+            Start-Sleep -Milliseconds 700
+            $wheel = Get-ProbeOrder @(0x10)
+            Note "press, Shift down, wheel, Shift up, release: probe got '$wheel'"
+            Assert ($wheel -match '^LDOWN:TCAT KEYDOWN\(10\):TCAT WHEEL\+S:TCAT KEYUP\(10\):(TCAT|0x0) LUP:(TCAT|0x0)$') "the wheel notch must follow the held press and the Shift press, with Shift down (expected 'LDOWN:TCAT KEYDOWN(10):TCAT WHEEL+S:TCAT KEYUP(10) LUP'), got '$wheel'"
+
+            $shot = Wait-Log 'screenshot \d+x\d+ copied|screenshot failed.*' $mark 200
+            $down = Get-DownKeys
+            Note "overlay while the button was still down: $(if ($overlay.Count) { $overlay -join ', ' } else { 'none' }); screenshot: $(if ($shot) { $shot } else { 'none' }); keys down afterwards: $down"
+            Assert ($overlay.Count -eq 0) "the hold went on after the other input (overlay shown: $($overlay -join ', '))"
+            Assert ($null -eq $shot) "the abandoned hold still took a screenshot: $shot"
+            Assert ($down -eq 'none') "keys stayed down: $down"
+            Assert-TedRunning
+        } finally {
+            if ($c) { Clear-DownKeys $c }
+            Stop-HookTedCat
+        }
+    }
+
     # Alt + hold and Win + hold swallow the press and the release, so the
     # app would see a lone Alt or Win tap (menu bar / Start menu). TedCat
     # injects the unassigned key 0xE8 while the modifier is down to prevent it.
@@ -2796,6 +2960,25 @@ namespace TedCatHookSmoke
         } finally {
             if ($c) { Clear-DownKeys $c }
             Stop-HookTedCat
+        }
+    }
+
+    # Every balloon TedCat showed during this run (the log keeps them as
+    # "notice: <title>: <text>") reads as whole sentences: reasons carry their
+    # own period and TedCat only appends sentences after them, so no text has
+    # ".." or a sentence inside parentheses. At least the emergency switch and
+    # the display change notices are among them.
+    Invoke-Step 'user-messages' {
+        $notices = @((Read-TedLog) -split "`r?`n" | Where-Object { $_ -match ' notice: ' } | ForEach-Object { $_.Trim() })
+        foreach ($line in $notices) { Note $line }
+        Assert ($notices.Count -ge 1) 'no notice was logged during the whole run, so there is nothing to check'
+        foreach ($line in $notices) {
+            $text = $line.Substring($line.IndexOf(' notice: ') + 9)
+            # "Recording saved: <path>" carries a file name, not a sentence.
+            if ($text.StartsWith('Recording saved: ')) { continue }
+            Assert ($text -notmatch '\.\.') "a notice has '..': $text"
+            Assert ($text -notmatch '\.\)') "a notice has a sentence inside parentheses: $text"
+            Assert ($text -match '[.!?]$') "a notice does not end with a full stop: $text"
         }
     }
 } catch {
