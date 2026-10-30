@@ -188,6 +188,7 @@ impl SelectionOverlay {
         self.refresh_label(clamped, anchor);
     }
 
+    #[allow(dead_code)] // part of the overlay contract; the controller tracks the mode itself
     pub fn mode(&self) -> CaptureMode {
         self.mode
     }

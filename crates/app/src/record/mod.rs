@@ -124,6 +124,9 @@ impl Recorder {
 }
 
 /// True when a default audio render (output) device exists.
+// Part of the public recording API; the UI currently reports the recorder's
+// own "no audio output device" error instead of checking up front.
+#[allow(dead_code)]
 pub fn audio_output_available() -> bool {
     audio::output_available()
 }

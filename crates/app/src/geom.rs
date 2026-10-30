@@ -72,14 +72,14 @@ impl RectPx {
             rect.max_y().ceil() as i32,
         )
     }
-    pub fn to_core(&self) -> Rect {
+    pub fn to_core(self) -> Rect {
         Rect::new(self.left as f64, self.top as f64, self.width() as f64, self.height() as f64)
     }
     /// The same rectangle in logical units for the given monitor scale.
-    pub fn to_logical(&self, scale: f64) -> Rect {
+    pub fn to_logical(self, scale: f64) -> Rect {
         self.to_core().scaled(1.0 / scale)
     }
-    pub fn to_win(&self) -> RECT {
+    pub fn to_win(self) -> RECT {
         RECT { left: self.left, top: self.top, right: self.right, bottom: self.bottom }
     }
     pub fn from_win(r: RECT) -> RectPx {
