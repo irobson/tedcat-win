@@ -16,17 +16,25 @@
       replay-double a quick double click arrives as a double click.
       replay-drag   a quick drag still moves a draggable knob, with
                     down / move / up delivered in order.
-      screenshot    hold 600 ms, drag, release: the clipboard holds an image
-                    of the selected size (CF_DIBV5 via Clipboard.GetImage and
-                    the registered "PNG" format), and the press never reached
-                    the window underneath.
-      recording     Shift + hold, drag >= 400x300, release; click the
-                    recording pill (TedCat.Hud) to stop; an .mp4 appears in
-                    Videos\TedCat; with ffprobe: H.264, expected even size,
-                    duration close to the recording time.
+      screenshot    hold 600 ms, drag, release: the overlay shows while
+                    selecting and goes away; the clipboard holds an image of
+                    the selected size and content (CF_DIBV5 via
+                    Clipboard.GetImage and the registered "PNG" format), and
+                    the press never reached the window underneath.
+      escape-cancel Escape during a selection closes the overlay, takes no
+                    screenshot and never delivers the press.
+      recording     Shift + hold, drag >= 400x300, release; no yellow capture
+                    border; click the recording pill (TedCat.Hud) to stop; an
+                    .mp4 appears in Videos\TedCat; with ffprobe: H.264,
+                    expected even size, duration close to the recording time.
       kill-switch   Escape x3 turns the gesture off: a later hold + drag
-                    makes no screenshot and a click still works.
+                    passes straight through (no overlay, no screenshot) and
+                    a click still works.
       after-exit    after TedCat is killed, clicks still work.
+
+    The test window tags every button message with GetMessageExtraInfo():
+    "TCAT" means TedCat held the event and replayed it, "0x0" means it came
+    straight from this script, which tells hold-and-replay from pass-through.
 
     TedCat is always stopped at the end, its log printed, and the script exits
     non-zero if any step FAILED. Artifacts (log, recordings, desktop
@@ -105,6 +113,11 @@ namespace TedCatSmoke
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern IntPtr GetMessageExtraInfo();
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NOTIFYICONIDENTIFIER { public uint cbSize; public IntPtr hWnd; public uint uID; public Guid guidItem; }
+        [DllImport("shell32.dll")] public static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER identifier, out RECT rect);
 
         [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseDesktop(IntPtr desktop);
@@ -217,6 +230,16 @@ namespace TedCatSmoke
                 if (!(Move(x, y) && Pause(stepMs))) return false;
             }
             return Pause(60) && Up(x2, y2);
+        }
+
+        /// Moves from (x1, y1) to (x2, y2) in `steps` steps, `stepMs` apart.
+        public static bool MovePath(int x1, int y1, int x2, int y2, int steps, int stepMs)
+        {
+            for (int i = 1; i <= steps; i++)
+            {
+                if (!(Move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps) && Pause(stepMs))) return false;
+            }
+            return true;
         }
 
         public static string Cursor()
@@ -397,6 +420,58 @@ namespace TedCatSmoke
             return result;
         }
 
+        /// Handle of the first top-level window of class `cls` (visible or not).
+        public static IntPtr Find(string cls)
+        {
+            IntPtr result = IntPtr.Zero;
+            Native.EnumWindows(delegate(IntPtr hwnd, IntPtr unused)
+            {
+                if (ClassOf(hwnd) == cls) { result = hwnd; return false; }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        /// Where the shell shows tray icon `id` of `owner`, or why it cannot say.
+        public static string TrayIcon(IntPtr owner, uint id)
+        {
+            Native.NOTIFYICONIDENTIFIER identifier = new Native.NOTIFYICONIDENTIFIER();
+            identifier.cbSize = (uint)Marshal.SizeOf(typeof(Native.NOTIFYICONIDENTIFIER));
+            identifier.hWnd = owner;
+            identifier.uID = id;
+            Native.RECT r;
+            int hr = Native.Shell_NotifyIconGetRect(ref identifier, out r);
+            if (hr != 0) return "error 0x" + hr.ToString("X8");
+            return "rect=" + r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom;
+        }
+
+        static bool Yellowish(Color c) { return c.R >= 170 && c.G >= 150 && c.B <= 110; }
+
+        /// How many of the four screen edges (sampled at their midpoints, two
+        /// pixels deep) show Windows.Graphics.Capture's yellow border, and the colours.
+        public static string CaptureBorder(out int yellowEdges)
+        {
+            yellowEdges = 0;
+            Rectangle s = Screen.PrimaryScreen.Bounds;
+            Point[] points = new Point[] {
+                new Point(s.Left, s.Top + s.Height / 2), new Point(s.Right - 1, s.Top + s.Height / 2),
+                new Point(s.Left + s.Width / 2, s.Top), new Point(s.Left + s.Width / 2, s.Bottom - 1) };
+            string[] names = new string[] { "left", "right", "top", "bottom" };
+            StringBuilder text = new StringBuilder();
+            using (Bitmap pixel = new Bitmap(1, 1))
+            using (Graphics g = Graphics.FromImage(pixel))
+            {
+                for (int i = 0; i < points.Length; i++)
+                {
+                    g.CopyFromScreen(points[i].X, points[i].Y, 0, 0, new Size(1, 1));
+                    Color c = pixel.GetPixel(0, 0);
+                    if (Yellowish(c)) yellowEdges++;
+                    text.Append(names[i] + "=" + c.R + "," + c.G + "," + c.B + " ");
+                }
+            }
+            return text.ToString().Trim();
+        }
+
         public static string WindowAt(int x, int y)
         {
             Native.POINT p; p.X = x; p.Y = y;
@@ -471,7 +546,7 @@ namespace TedCatSmoke
                 long lp = m.LParam.ToInt64();
                 Point screen = PointToScreen(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
                 bool left = (m.WParam.ToInt64() & 1) != 0;
-                if (msg != 0x200 || left) Ui.Log(Name, MessageName(msg), screen);
+                if (msg != 0x200 || left) Ui.Log(Name, MessageName(msg), screen, Native.GetMessageExtraInfo());
                 if (Draggable)
                 {
                     if (msg == 0x201 || msg == 0x203)
@@ -492,9 +567,24 @@ namespace TedCatSmoke
         }
     }
 
+    /// A button that also logs its raw left-button messages, like EventPanel.
+    public class CountingButton : Button
+    {
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x201 || m.Msg == 0x202 || m.Msg == 0x203)
+            {
+                long lp = m.LParam.ToInt64();
+                Point screen = PointToScreen(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+                Ui.Log(Name, m.Msg == 0x201 ? "DOWN" : m.Msg == 0x202 ? "UP" : "DBLCLK", screen, Native.GetMessageExtraInfo());
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     public class SmokeForm : Form
     {
-        public Button Counter;
+        public CountingButton Counter;
         public EventPanel Pad;
         public Panel DragArea;
         public EventPanel Knob;
@@ -517,7 +607,7 @@ namespace TedCatSmoke
             BackColor = Color.WhiteSmoke;
             int w = ClientSize.Width, h = ClientSize.Height;
 
-            Counter = new Button();
+            Counter = new CountingButton();
             Counter.Name = "Counter";
             Counter.Text = "Clicks: 0";
             Counter.SetBounds(10, 10, 200, 60);
@@ -589,9 +679,21 @@ namespace TedCatSmoke
         public static SmokeForm Form;
         public static int Clicks;
 
+        /// TedCat marks the events it replays with dwExtraInfo "TCAT".
+        public const long TedCatMarker = 0x54434154;
+
         public static void Log(string who, string what, Point p)
         {
-            lock (Gate) events.Add(Environment.TickCount + " " + who + " " + what + " " + p.X + "," + p.Y);
+            Log(who, what, p, IntPtr.Zero);
+        }
+
+        /// One line: "tick control what x,y extra", extra being "TCAT" for
+        /// TedCat's replays and "0x.." otherwise.
+        public static void Log(string who, string what, Point p, IntPtr extraInfo)
+        {
+            long extra = extraInfo.ToInt64();
+            string tag = extra == TedCatMarker ? "TCAT" : "0x" + extra.ToString("X");
+            lock (Gate) events.Add(Environment.TickCount + " " + who + " " + what + " " + p.X + "," + p.Y + " " + tag);
         }
 
         public static string[] Events() { lock (Gate) return events.ToArray(); }
@@ -765,6 +867,33 @@ function Get-ButtonSequence([string]$Control) {
     return ($names -join ' ')
 }
 
+# "DOWN:TCAT UP:0x0 ..." for a control's button messages: TCAT marks the
+# events TedCat held and replayed, anything else came straight through.
+function Get-TaggedSequence([string]$Control) {
+    $tagged = @(Get-Events $Control | Where-Object { ($_ -split ' ')[2] -in @('DOWN', 'UP', 'DBLCLK') } | ForEach-Object { $f = $_ -split ' '; '{0}:{1}' -f $f[2], $f[4] })
+    return ($tagged -join ' ')
+}
+
+function Get-VisibleOverlay {
+    return @([TedCatSmoke.Win]::Windows('TedCat.Overlay.') | Where-Object { $_ -match 'visible=True' } | ForEach-Object { ($_ -split ' ')[0] })
+}
+
+# Press at (X1, Y1), hold still for HoldMs, drag to (X2, Y2), run WhileHeld,
+# release. The button is always released, even when WhileHeld throws.
+function Invoke-HoldDrag([int]$X1, [int]$Y1, [int]$X2, [int]$Y2, [int]$HoldMs = 600, [scriptblock]$WhileHeld = $null) {
+    Invoke-Input ([TedCatSmoke.Input]::Move($X1, $Y1)) 'the move to the press point'
+    Start-Sleep -Milliseconds 60
+    Invoke-Input ([TedCatSmoke.Input]::Down($X1, $Y1)) 'the press'
+    try {
+        Start-Sleep -Milliseconds $HoldMs
+        Invoke-Input ([TedCatSmoke.Input]::MovePath($X1, $Y1, $X2, $Y2, 20, 15)) 'the drag'
+        Start-Sleep -Milliseconds 150
+        if ($WhileHeld) { & $WhileHeld | Out-Host }
+    } finally {
+        if (-not [TedCatSmoke.Input]::Up($X2, $Y2)) { Write-Host "    (release failed: $([TedCatSmoke.Input]::LastError))" }
+    }
+}
+
 function Assert-TedRunning {
     if ($script:Ted -and $script:Ted.HasExited) {
         throw ('TedCat exited unexpectedly with code 0x{0:X8}' -f $script:Ted.ExitCode)
@@ -778,13 +907,23 @@ function Wait-Clicks([int]$Expected, [int]$TimeoutMs = 3000) {
     return [TedCatSmoke.Ui]::Clicks
 }
 
-function Test-CounterClick([string]$What) {
+# One quick click on the counter must count exactly once. With -Replayed the
+# press and release must be TedCat's replays (held, then re-injected);
+# without, they must have come straight through.
+function Test-CounterClick([string]$What, [bool]$Replayed) {
+    [TedCatSmoke.Ui]::ClearEvents()
     $before = [TedCatSmoke.Ui]::Clicks
     $c = Center ([TedCatSmoke.Ui]::Rect('Counter'))
     Invoke-Input ([TedCatSmoke.Input]::Click($c[0], $c[1], 40)) $What
     $after = Wait-Clicks ($before + 1)
-    Note "counter $before -> $after after one quick click at $($c[0]),$($c[1])"
+    $tagged = Get-TaggedSequence 'Counter'
+    Note "counter $before -> $after after one quick click at $($c[0]),$($c[1]); button got '$tagged'"
     Assert ($after -eq $before + 1) "a quick click on the counter changed it by $($after - $before) instead of exactly 1"
+    if ($Replayed) {
+        Assert ($tagged -eq 'DOWN:TCAT UP:TCAT') "expected TedCat's replayed press and release (DOWN:TCAT UP:TCAT), got '$tagged'"
+    } else {
+        Assert ($tagged -match '^DOWN:0x0 UP:0x0$') "expected the click to pass straight through (DOWN:0x0 UP:0x0), got '$tagged'"
+    }
 }
 
 function Clipboard-HasImage {
@@ -860,6 +999,7 @@ try {
         }
         Note "cursor after the click: $([TedCatSmoke.Input]::Cursor())"
         $after = Wait-Clicks 1
+        Note "button got '$(Get-TaggedSequence 'Counter')'"
         if ($after -ne 1) {
             $script:EnvironmentProblem = "SendInput succeeded but the click never reached the test window (count $after, window under the cursor: $([TedCatSmoke.Win]::WindowAt($c[0], $c[1])))"
             Save-Desktop 'baseline-no-click'
@@ -886,10 +1026,16 @@ try {
         }
         Assert-TedRunning
         Note ("TedCat windows: {0}" -f ([TedCatSmoke.Win]::Windows('TedCat.') -join '; '))
+        $main = [TedCatSmoke.Win]::Find('TedCat.Main')
+        Assert ($main -ne [IntPtr]::Zero) 'no TedCat.Main window'
+        [void](Wait-Until { [TedCatSmoke.Win]::TrayIcon($main, 1).StartsWith('rect=') } 5000)
+        $tray = [TedCatSmoke.Win]::TrayIcon($main, 1)
+        Note "tray icon: $tray"
+        Assert ($tray.StartsWith('rect=')) "the shell does not know TedCat's tray icon ($tray)"
     }
 
     Invoke-Step 'replay-click' {
-        Test-CounterClick 'the quick click'
+        Test-CounterClick 'the quick click' $true
         Assert-TedRunning
     }
 
@@ -904,6 +1050,9 @@ try {
         Note "pad received: $sequence; MouseDoubleClick events: $doubles"
         Assert ($sequence -eq 'DOWN UP DBLCLK UP') "expected 'DOWN UP DBLCLK UP' on the pad, got '$sequence'"
         Assert ($doubles -eq 1) "expected exactly one MouseDoubleClick, got $doubles"
+        $tagged = Get-TaggedSequence 'Pad'
+        Note "with replay markers: $tagged"
+        Assert ($tagged -eq 'DOWN:TCAT UP:TCAT DBLCLK:TCAT UP:TCAT') "expected all four to be TedCat's replays, got '$tagged'"
         Assert-TedRunning
     }
 
@@ -928,6 +1077,9 @@ try {
         Assert (@($events | Where-Object { $_ -eq 'DOWN' }).Count -eq 1 -and @($events | Where-Object { $_ -eq 'UP' }).Count -eq 1) "expected exactly one DOWN and one UP, got '$sequence'"
         Assert (@($events | Where-Object { $_ -eq 'MOVE' }).Count -ge 1) 'no MOVE between DOWN and UP'
         Assert ([Math]::Abs($moved[0] - $dx) -le 2 -and [Math]::Abs($moved[1]) -le 2) "the knob moved by $($moved[0]),$($moved[1]) instead of $dx,0"
+        $tagged = Get-TaggedSequence 'Knob'
+        Note "with replay markers: $tagged (the held press is replayed, the rest of the drag flows through)"
+        Assert ($tagged -match '^DOWN:TCAT UP:') "expected the press to be TedCat's replay, got '$tagged'"
         [TedCatSmoke.Ui]::ResetKnob()
         Assert-TedRunning
     }
@@ -941,8 +1093,11 @@ try {
         $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
         $x2 = $x1 + $w; $y2 = $y1 + $h
         $mark = Get-LogMark
-        Invoke-Input ([TedCatSmoke.Input]::Drag($x1, $y1, $x2, $y2, 600, 20, 15)) 'the screenshot gesture'
+        $script:overlay = @()
+        Invoke-HoldDrag $x1 $y1 $x2 $y2 600 { $script:overlay = @(Get-VisibleOverlay) }
         $hasImage = Wait-Until { Clipboard-HasImage } 5000
+        Note "overlay while selecting: $($script:overlay -join ', ')"
+        Assert ('TedCat.Overlay.Dim' -in $script:overlay -and 'TedCat.Overlay.Frame' -in $script:overlay -and 'TedCat.Overlay.Label' -in $script:overlay) 'the selection overlay (dim, frame, label) was not on screen while selecting' 
         $line = Wait-Log 'screenshot \d+x\d+ copied|screenshot failed' $mark 2000
         Note "log: $(if ($line) { $line } else { '(no screenshot line)' })"
         Note ("clipboard formats: {0}; owner pid {1} (TedCat {2})" -f ([TedCatSmoke.Clip]::Formats() -join ', '), [TedCatSmoke.Clip]::OwnerPid(), $script:Ted.Id)
@@ -965,6 +1120,36 @@ try {
         $leaked = @(Get-Events 'Canvas' | Where-Object { $_ -match ' (DOWN|UP|DBLCLK) ' })
         Note "button messages that reached the window under the selection: $($leaked.Count)"
         Assert ($leaked.Count -eq 0) "the held press leaked to the window underneath: $($leaked -join '; ')"
+        Start-Sleep -Milliseconds 500
+        $left = @(Get-VisibleOverlay)
+        Note "overlay windows still visible after the capture: $(if ($left.Count) { $left -join ', ' } else { 'none' })"
+        Assert ($left.Count -eq 0) "the overlay stayed on screen after the screenshot: $($left -join ', ')"
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'escape-cancel' {
+        Assert ([TedCatSmoke.Clip]::Clear()) 'could not clear the clipboard'
+        [TedCatSmoke.Ui]::ClearEvents()
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
+        $mark = Get-LogMark
+        $script:overlay = @(); $script:overlayAfterEscape = @()
+        Invoke-HoldDrag $x1 $y1 ($x1 + 300) ($y1 + 180) 600 {
+            $script:overlay = @(Get-VisibleOverlay)
+            Invoke-Input ([TedCatSmoke.Input]::Tap($VK_ESCAPE, $SC_ESCAPE, 30)) 'Escape'
+            Start-Sleep -Milliseconds 400
+            $script:overlayAfterEscape = @(Get-VisibleOverlay)
+        }
+        Start-Sleep -Milliseconds 1500
+        $shot = Wait-Log 'screenshot \d+x\d+ copied' $mark 100
+        $hasImage = Clipboard-HasImage
+        $tagged = Get-TaggedSequence 'Canvas'
+        Note "overlay before Escape: $($script:overlay -join ', '); after Escape: $(if ($script:overlayAfterEscape.Count) { $script:overlayAfterEscape -join ', ' } else { 'none' })"
+        Note "clipboard image: $hasImage; canvas got '$tagged' (the release after a cancel is passed on by design)"
+        Assert ('TedCat.Overlay.Dim' -in $script:overlay) 'the overlay never appeared, so there was nothing to cancel'
+        Assert ($script:overlayAfterEscape.Count -eq 0) "Escape did not close the overlay: $($script:overlayAfterEscape -join ', ')"
+        Assert (-not $hasImage -and -not $shot) 'a screenshot was taken although Escape cancelled the selection'
+        Assert ($tagged -notmatch 'DOWN') "the cancelled press reached the window underneath: '$tagged'"
         Assert-TedRunning
     }
 
@@ -977,14 +1162,24 @@ try {
         Assert ($w -ge 400 -and $h -ge 300) "the screen is too small for a 400x300 recording region (canvas $($canvas -join ','))"
         $x1 = $canvas[0] + 30; $y1 = $canvas[1] + 30
         $x2 = $x1 + $w; $y2 = $y1 + $h
+        $yellowBefore = 0
+        $edgesBefore = [TedCatSmoke.Win]::CaptureBorder([ref]$yellowBefore)
         $mark = Get-LogMark
+        $script:overlay = @()
         Invoke-Input ([TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $false)) 'Shift down'
-        Start-Sleep -Milliseconds 80
-        $dragged = [TedCatSmoke.Input]::Drag($x1, $y1, $x2, $y2, 600, 24, 15)
-        Start-Sleep -Milliseconds 80
-        $released = [TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $true)
-        Invoke-Input ($dragged -and $released) 'the recording gesture'
-        Note "Shift + hold + drag from $x1,$y1 to $x2,$y2 (${w}x${h})"
+        try {
+            Start-Sleep -Milliseconds 80
+            Invoke-HoldDrag $x1 $y1 $x2 $y2 600 { $script:overlay = @(Get-VisibleOverlay) }
+            Start-Sleep -Milliseconds 80
+        } finally {
+            [void][TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $true)
+        }
+        Note "Shift + hold + drag from $x1,$y1 to $x2,$y2 (${w}x${h}); overlay while selecting: $($script:overlay -join ', ')"
+        # Checked once the recording is stopped, so a failure never leaves it running.
+        $problems = New-Object System.Collections.Generic.List[string]
+        if (-not ('TedCat.Overlay.Dim' -in $script:overlay -and 'TedCat.Overlay.Frame' -in $script:overlay)) {
+            $problems.Add('the recording selection overlay was not on screen while selecting')
+        }
 
         $script:hud = $null
         [void](Wait-Until { $script:hud = [TedCatSmoke.Win]::FindVisible('TedCat.Hud'); ($null -ne $script:hud) -or [bool]((Get-LogSince $mark) -match 'recording could not start|too small to record') } 20000)
@@ -996,7 +1191,17 @@ try {
         Assert ($null -ne $script:hud) 'no recording pill (TedCat.Hud) appeared within 20 s'
         Note ("recording pill at {0}" -f ($script:hud -join ','))
         Note ("TedCat windows: {0}" -f ([TedCatSmoke.Win]::Windows('TedCat.') -join '; '))
+        Start-Sleep -Milliseconds 700
         Save-Desktop 'recording-in-progress'
+        $yellowDuring = 0
+        $edgesDuring = [TedCatSmoke.Win]::CaptureBorder([ref]$yellowDuring)
+        Note "screen edges before recording: $edgesBefore; while recording: $edgesDuring"
+        $borderLine = Wait-Log 'borderless capture (not granted|unavailable).*|capture border cannot be disabled.*' $mark 100
+        if ($borderLine) {
+            Note "TedCat could not turn off the capture border here: $borderLine"
+        } elseif ($yellowDuring -ge 3 -and $yellowBefore -lt 3) {
+            $problems.Add("Windows draws its yellow capture border around the whole screen while recording ($yellowDuring of 4 edges yellow), although TedCat asked for a borderless capture")
+        }
 
         Start-Sleep -Seconds $RecordSeconds
         $pill = [TedCatSmoke.Win]::FindVisible('TedCat.Hud')
@@ -1040,6 +1245,7 @@ try {
         # The saved card replaces the pill.
         $card = Wait-Until { $null -ne [TedCatSmoke.Win]::FindVisible('TedCat.Card') } 3000
         Note ("saved card shown: {0}" -f $card)
+        Assert ($problems.Count -eq 0) ($problems -join '; ')
         Assert-TedRunning
     }
 
@@ -1060,15 +1266,17 @@ try {
         $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
         $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
         $mark = Get-LogMark
-        Invoke-Input ([TedCatSmoke.Input]::Drag($x1, $y1, $x1 + 320, $y1 + 200, 600, 20, 15)) 'the hold + drag after the kill switch'
+        $script:overlay = @()
+        Invoke-HoldDrag $x1 $y1 ($x1 + 320) ($y1 + 200) 600 { $script:overlay = @(Get-VisibleOverlay) }
         Start-Sleep -Seconds 3
         $hasImage = Clipboard-HasImage
         $shot = Wait-Log 'screenshot \d+x\d+ copied' $mark 100
-        $sequence = Get-ButtonSequence 'Canvas'
-        Note ("after hold + drag: clipboard image {0}, formats [{1}], canvas got '{2}'" -f $hasImage, ([TedCatSmoke.Clip]::Formats() -join ', '), $sequence)
+        $tagged = Get-TaggedSequence 'Canvas'
+        Note ("after hold + drag: overlay [{0}], clipboard image {1}, formats [{2}], canvas got '{3}'" -f ($script:overlay -join ', '), $hasImage, ([TedCatSmoke.Clip]::Formats() -join ', '), $tagged)
+        Assert ($script:overlay.Count -eq 0) "the overlay appeared although the gesture is off: $($script:overlay -join ', ')"
         Assert (-not $hasImage -and -not $shot) 'a screenshot was taken although the gesture is off'
-        Assert ($sequence -eq 'DOWN UP') "with the gesture off the press must pass straight through; the canvas got '$sequence'"
-        Test-CounterClick 'the click after the kill switch'
+        Assert ($tagged -eq 'DOWN:0x0 UP:0x0') "with the gesture off the press must pass straight through, not held or replayed; the canvas got '$tagged'"
+        Test-CounterClick 'the click after the kill switch' $false
         Assert-TedRunning
     }
 
@@ -1080,7 +1288,7 @@ try {
         }
         Note ('TedCat stopped (exit code 0x{0:X8})' -f $script:Ted.ExitCode)
         if ($script:EnvironmentProblem) { Skip $script:EnvironmentProblem }
-        Test-CounterClick 'the click after TedCat exited'
+        Test-CounterClick 'the click after TedCat exited' $false
     }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
