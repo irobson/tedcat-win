@@ -12,16 +12,12 @@
 
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tedcat_core::VideoEncodingPlan;
 use windows::core::{IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{
-    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind,
-    GraphicsCaptureItem, GraphicsCaptureSession,
-};
-use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
+use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{E_FAIL, HMODULE};
@@ -48,8 +44,6 @@ use crate::{log_info, log_warn};
 
 /// How long `start` waits for the first captured frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long `start` waits for Windows to answer the borderless-capture request.
-const BORDERLESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A captured frame waiting to be written (or the last one, at stop).
 pub(super) struct PendingFrame {
@@ -151,13 +145,6 @@ impl VideoCapture {
         if let Err(e) = session.SetIsCursorCaptureEnabled(show_cursor) {
             log_info!("cursor capture setting unavailable: {}", describe(&e));
         }
-        // Without the borderless grant Windows accepts `IsBorderRequired(false)`
-        // but still draws its yellow border around the whole monitor.
-        match request_borderless_capture() {
-            Ok(status) if status == AppCapabilityAccessStatus::Allowed => {}
-            Ok(status) => log_info!("borderless capture not granted (status {}); Windows shows its capture border", status.0),
-            Err(e) => log_info!("borderless capture unavailable ({e}); Windows shows its capture border"),
-        }
         if let Err(e) = session.SetIsBorderRequired(false) {
             log_info!("capture border cannot be disabled here: {}", describe(&e));
         }
@@ -253,29 +240,6 @@ impl VideoCapture {
             log_warn!("{} video frames were dropped because the encoder fell behind", state.dropped);
         }
         VideoOutcome { last: state.pending.take(), thumbnail: state.thumbnail.take(), interval: state.throttle.interval() }
-    }
-}
-
-/// Asks Windows to let TedCat capture without the yellow capture border.
-/// Unpackaged apps get the grant without a prompt; the wait is bounded so a
-/// prompt or a slow broker can never hold up the start of a recording.
-fn request_borderless_capture() -> Result<AppCapabilityAccessStatus, String> {
-    let request =
-        GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).map_err(|e| describe(&e))?;
-    let deadline = Instant::now() + BORDERLESS_REQUEST_TIMEOUT;
-    loop {
-        let status = request.Status().map_err(|e| describe(&e))?;
-        if status == windows_future::AsyncStatus::Completed {
-            return request.GetResults().map_err(|e| describe(&e));
-        }
-        if status != windows_future::AsyncStatus::Started {
-            return Err(format!("the request ended with status {}", status.0));
-        }
-        if Instant::now() >= deadline {
-            let _ = request.Cancel();
-            return Err("no answer in time".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
