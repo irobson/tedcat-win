@@ -1,0 +1,1126 @@
+<#
+.SYNOPSIS
+    End-to-end smoke test of TedCat.exe on a real (or CI) Windows desktop.
+
+.DESCRIPTION
+    Starts TedCat.exe, waits for its input hook, then drives it with SendInput
+    (injected events without TedCat's "TCAT" dwExtraInfo marker count as real
+    input by design) against a small WinForms test window hosted by this
+    script, and checks:
+
+      baseline      SendInput reaches the test window before TedCat runs
+                    (proves the desktop is interactive; otherwise every
+                    gesture step is reported SKIPPED with the evidence).
+      start         TedCat starts and reports "input hook status: Active".
+      replay-click  a quick click on a counter button counts exactly once.
+      replay-double a quick double click arrives as a double click.
+      replay-drag   a quick drag still moves a draggable knob, with
+                    down / move / up delivered in order.
+      screenshot    hold 600 ms, drag, release: the clipboard holds an image
+                    of the selected size (CF_DIBV5 via Clipboard.GetImage and
+                    the registered "PNG" format), and the press never reached
+                    the window underneath.
+      recording     Shift + hold, drag >= 400x300, release; click the
+                    recording pill (TedCat.Hud) to stop; an .mp4 appears in
+                    Videos\TedCat; with ffprobe: H.264, expected even size,
+                    duration close to the recording time.
+      kill-switch   Escape x3 turns the gesture off: a later hold + drag
+                    makes no screenshot and a click still works.
+      after-exit    after TedCat is killed, clicks still work.
+
+    TedCat is always stopped at the end, its log printed, and the script exits
+    non-zero if any step FAILED. Artifacts (log, recordings, desktop
+    screenshots of failures, summary.json) go to -ArtifactsDir.
+
+    Runs on Windows PowerShell 5.1 (STA; it re-launches itself with -STA if needed).
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1 -Exe target\release\TedCat.exe
+#>
+[CmdletBinding()]
+param(
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\TedCat.exe'),
+    [string]$ArtifactsDir = (Join-Path (Get-Location) 'smoke-artifacts'),
+    [int]$RecordSeconds = 3
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
+    Write-Host 'Not in a single-threaded apartment; re-launching with -STA.'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File $PSCommandPath -Exe $Exe -ArtifactsDir $ArtifactsDir -RecordSeconds $RecordSeconds
+    exit $LASTEXITCODE
+}
+
+$Exe = [System.IO.Path]::GetFullPath($Exe)
+$ArtifactsDir = [System.IO.Path]::GetFullPath($ArtifactsDir)
+New-Item -ItemType Directory -Force -Path $ArtifactsDir | Out-Null
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ---------------------------------------------------------------------------
+# Native helpers (C# 5: compiled by Windows PowerShell 5.1's Add-Type).
+
+$helpers = @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace TedCatSmoke
+{
+    public static class Native
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)]
+        public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct INPUT { public uint type; public InputUnion u; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint SendInput(uint count, [In, MarshalAs(UnmanagedType.LPArray)] INPUT[] inputs, int size);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+        [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint period);
+
+        public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lparam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, StringBuilder name, int max);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseDesktop(IntPtr desktop);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool GetUserObjectInformation(IntPtr obj, int index, StringBuilder info, int length, out int needed);
+        [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool OpenClipboard(IntPtr owner);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseClipboard();
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool EmptyClipboard();
+        [DllImport("user32.dll")] public static extern uint EnumClipboardFormats(uint format);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClipboardFormatName(uint format, StringBuilder name, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern uint RegisterClipboardFormat(string name);
+        [DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint format);
+        [DllImport("user32.dll")] public static extern IntPtr GetClipboardOwner();
+        [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr mem);
+        [DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr mem);
+        [DllImport("kernel32.dll")] public static extern UIntPtr GlobalSize(IntPtr mem);
+    }
+
+    /// Injected input. dwExtraInfo is 0, never TedCat's "TCAT" marker, so
+    /// TedCat's hook treats these events like real input.
+    public static class Input
+    {
+        public static string LastError = "";
+        public static int Sent;
+
+        static Input() { Native.timeBeginPeriod(1); }
+
+        static int Normalize(int value, int origin, int extent)
+        {
+            if (extent <= 1) return 0;
+            long offset = Math.Max(0L, Math.Min((long)extent - 1, (long)value - origin));
+            return (int)Math.Min(65535L, (offset * 65536 + 32768) / extent);
+        }
+
+        static Native.INPUT Mouse(int x, int y, uint buttons)
+        {
+            int left = Native.GetSystemMetrics(76), top = Native.GetSystemMetrics(77);
+            int width = Native.GetSystemMetrics(78), height = Native.GetSystemMetrics(79);
+            Native.INPUT input = new Native.INPUT();
+            input.type = 0;
+            input.u.mi.dx = Normalize(x, left, width);
+            input.u.mi.dy = Normalize(y, top, height);
+            // MOVE | ABSOLUTE | VIRTUALDESK, plus the button flags.
+            input.u.mi.dwFlags = buttons | 0x0001 | 0x8000 | 0x4000;
+            input.u.mi.dwExtraInfo = IntPtr.Zero;
+            return input;
+        }
+
+        static bool Send(Native.INPUT input)
+        {
+            Native.INPUT[] inputs = new Native.INPUT[] { input };
+            uint inserted = Native.SendInput(1, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+            if (inserted != 1)
+            {
+                LastError = "SendInput inserted " + inserted + " of 1 events, error " + Marshal.GetLastWin32Error();
+                return false;
+            }
+            Sent++;
+            return true;
+        }
+
+        static bool Pause(int ms) { if (ms > 0) Thread.Sleep(ms); return true; }
+
+        public static bool Move(int x, int y) { return Send(Mouse(x, y, 0)); }
+        public static bool Down(int x, int y) { return Send(Mouse(x, y, 0x0002)); }
+        public static bool Up(int x, int y) { return Send(Mouse(x, y, 0x0004)); }
+
+        public static bool Key(ushort vk, ushort scan, bool up)
+        {
+            Native.INPUT input = new Native.INPUT();
+            input.type = 1;
+            input.u.ki.wVk = vk;
+            input.u.ki.wScan = scan;
+            input.u.ki.dwFlags = up ? 0x0002u : 0u;
+            input.u.ki.dwExtraInfo = IntPtr.Zero;
+            return Send(input);
+        }
+
+        public static bool Tap(ushort vk, ushort scan, int holdMs)
+        {
+            return Key(vk, scan, false) && Pause(holdMs) && Key(vk, scan, true);
+        }
+
+        /// Move there, press, wait holdMs, release.
+        public static bool Click(int x, int y, int holdMs)
+        {
+            return Move(x, y) && Pause(40) && Down(x, y) && Pause(holdMs) && Up(x, y);
+        }
+
+        public static bool DoubleClick(int x, int y, int holdMs, int gapMs)
+        {
+            return Move(x, y) && Pause(40)
+                && Down(x, y) && Pause(holdMs) && Up(x, y) && Pause(gapMs)
+                && Down(x, y) && Pause(holdMs) && Up(x, y);
+        }
+
+        /// Press at (x1, y1), hold still for holdMs, move in `steps` steps to (x2, y2), release.
+        public static bool Drag(int x1, int y1, int x2, int y2, int holdMs, int steps, int stepMs)
+        {
+            if (!(Move(x1, y1) && Pause(60) && Down(x1, y1) && Pause(holdMs))) return false;
+            for (int i = 1; i <= steps; i++)
+            {
+                int x = x1 + (x2 - x1) * i / steps;
+                int y = y1 + (y2 - y1) * i / steps;
+                if (!(Move(x, y) && Pause(stepMs))) return false;
+            }
+            return Pause(60) && Up(x2, y2);
+        }
+
+        public static string Cursor()
+        {
+            Native.POINT p;
+            if (!Native.GetCursorPos(out p)) return "unknown (error " + Marshal.GetLastWin32Error() + ")";
+            return p.X + "," + p.Y;
+        }
+    }
+
+    public static class Clip
+    {
+        static bool Open()
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                // A NULL owner: emptying never makes this process the owner, so
+                // TedCat's EmptyClipboard never has to wait for this script.
+                if (Native.OpenClipboard(IntPtr.Zero)) return true;
+                Thread.Sleep(20);
+            }
+            return false;
+        }
+
+        public static bool Clear()
+        {
+            if (!Open()) return false;
+            try { return Native.EmptyClipboard(); }
+            finally { Native.CloseClipboard(); }
+        }
+
+        static string FormatName(uint format)
+        {
+            switch (format)
+            {
+                case 1: return "CF_TEXT";
+                case 2: return "CF_BITMAP";
+                case 7: return "CF_OEMTEXT";
+                case 8: return "CF_DIB";
+                case 13: return "CF_UNICODETEXT";
+                case 16: return "CF_LOCALE";
+                case 17: return "CF_DIBV5";
+            }
+            StringBuilder name = new StringBuilder(256);
+            if (Native.GetClipboardFormatName(format, name, name.Capacity) > 0) return name.ToString();
+            return "#" + format;
+        }
+
+        public static string[] Formats()
+        {
+            List<string> names = new List<string>();
+            if (!Open()) return new string[] { "(clipboard busy)" };
+            try
+            {
+                uint format = 0;
+                while ((format = Native.EnumClipboardFormats(format)) != 0) names.Add(FormatName(format));
+            }
+            finally { Native.CloseClipboard(); }
+            return names.ToArray();
+        }
+
+        public static byte[] Data(string registeredName)
+        {
+            uint format = Native.RegisterClipboardFormat(registeredName);
+            if (format == 0 || !Open()) return null;
+            try
+            {
+                IntPtr handle = Native.GetClipboardData(format);
+                if (handle == IntPtr.Zero) return null;
+                IntPtr ptr = Native.GlobalLock(handle);
+                if (ptr == IntPtr.Zero) return null;
+                try
+                {
+                    int size = (int)Native.GlobalSize(handle).ToUInt64();
+                    byte[] bytes = new byte[size];
+                    Marshal.Copy(ptr, bytes, 0, size);
+                    return bytes;
+                }
+                finally { Native.GlobalUnlock(handle); }
+            }
+            finally { Native.CloseClipboard(); }
+        }
+
+        /// "WxH" of the PNG on the clipboard, or null.
+        public static string PngSize()
+        {
+            byte[] bytes = Data("PNG");
+            if (bytes == null) return null;
+            using (MemoryStream stream = new MemoryStream(bytes))
+            using (Image image = Image.FromStream(stream))
+            {
+                return image.Width + "x" + image.Height;
+            }
+        }
+
+        public static uint OwnerPid()
+        {
+            IntPtr owner = Native.GetClipboardOwner();
+            if (owner == IntPtr.Zero) return 0;
+            uint pid;
+            Native.GetWindowThreadProcessId(owner, out pid);
+            return pid;
+        }
+    }
+
+    public static class Win
+    {
+        public static string InitDpi()
+        {
+            try
+            {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, like TedCat.
+                if (Native.SetProcessDpiAwarenessContext(new IntPtr(-4))) return "per-monitor v2";
+                return "SetProcessDpiAwarenessContext failed (error " + Marshal.GetLastWin32Error() + ")";
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return Native.SetProcessDPIAware() ? "system aware" : "unaware";
+            }
+        }
+
+        public static string InputDesktop()
+        {
+            IntPtr desktop = Native.OpenInputDesktop(0, false, 0x0001);
+            if (desktop == IntPtr.Zero) return "none (OpenInputDesktop error " + Marshal.GetLastWin32Error() + ")";
+            try
+            {
+                StringBuilder name = new StringBuilder(256);
+                int needed;
+                if (!Native.GetUserObjectInformation(desktop, 2, name, name.Capacity * 2, out needed)) return "unnamed";
+                return name.ToString();
+            }
+            finally { Native.CloseDesktop(desktop); }
+        }
+
+        static string ClassOf(IntPtr hwnd)
+        {
+            StringBuilder name = new StringBuilder(256);
+            Native.GetClassName(hwnd, name, name.Capacity);
+            return name.ToString();
+        }
+
+        /// Every top-level window whose class starts with `prefix`: "class visible=.. rect=l,t,r,b pid=..".
+        public static string[] Windows(string prefix)
+        {
+            List<string> found = new List<string>();
+            Native.EnumWindows(delegate(IntPtr hwnd, IntPtr unused)
+            {
+                string cls = ClassOf(hwnd);
+                if (cls.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    Native.RECT r;
+                    Native.GetWindowRect(hwnd, out r);
+                    uint pid;
+                    Native.GetWindowThreadProcessId(hwnd, out pid);
+                    found.Add(cls + " visible=" + Native.IsWindowVisible(hwnd) + " rect=" + r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom + " pid=" + pid);
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found.ToArray();
+        }
+
+        /// Rectangle (l, t, r, b) of the first visible top-level window of class `cls`, or null.
+        public static int[] FindVisible(string cls)
+        {
+            int[] result = null;
+            Native.EnumWindows(delegate(IntPtr hwnd, IntPtr unused)
+            {
+                if (ClassOf(hwnd) == cls && Native.IsWindowVisible(hwnd))
+                {
+                    Native.RECT r;
+                    Native.GetWindowRect(hwnd, out r);
+                    result = new int[] { r.Left, r.Top, r.Right, r.Bottom };
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        public static string WindowAt(int x, int y)
+        {
+            Native.POINT p; p.X = x; p.Y = y;
+            IntPtr hwnd = Native.WindowFromPoint(p);
+            if (hwnd == IntPtr.Zero) return "(none)";
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            return ClassOf(hwnd) + " pid=" + pid;
+        }
+
+        public static string Foreground()
+        {
+            IntPtr hwnd = Native.GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return "(none)";
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            return ClassOf(hwnd) + " pid=" + pid;
+        }
+
+        /// Saves the whole virtual screen as PNG; returns null or the error.
+        public static string Shot(string path)
+        {
+            try
+            {
+                Rectangle screen = SystemInformation.VirtualScreen;
+                using (Bitmap bitmap = new Bitmap(screen.Width, screen.Height))
+                {
+                    using (Graphics g = Graphics.FromImage(bitmap)) g.CopyFromScreen(screen.Left, screen.Top, 0, 0, screen.Size);
+                    bitmap.Save(path, ImageFormat.Png);
+                }
+                return null;
+            }
+            catch (Exception e) { return e.Message; }
+        }
+
+        public static string ReadShared(string path)
+        {
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+    }
+
+    /// A panel that logs raw left-button messages (and moves with the button
+    /// down) in screen coordinates; `Draggable` makes it follow a drag.
+    public class EventPanel : Panel
+    {
+        public bool Draggable;
+        bool dragging;
+        Point startCursor;
+        Point startLocation;
+
+        static string MessageName(int msg)
+        {
+            switch (msg)
+            {
+                case 0x200: return "MOVE";
+                case 0x201: return "DOWN";
+                case 0x202: return "UP";
+                case 0x203: return "DBLCLK";
+            }
+            return "0x" + msg.ToString("X");
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            int msg = m.Msg;
+            if (msg >= 0x200 && msg <= 0x203)
+            {
+                long lp = m.LParam.ToInt64();
+                Point screen = PointToScreen(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+                bool left = (m.WParam.ToInt64() & 1) != 0;
+                if (msg != 0x200 || left) Ui.Log(Name, MessageName(msg), screen);
+                if (Draggable)
+                {
+                    if (msg == 0x201 || msg == 0x203)
+                    {
+                        dragging = true;
+                        startCursor = screen;
+                        startLocation = Location;
+                        Capture = true;
+                    }
+                    else if (dragging && ((msg == 0x200 && left) || msg == 0x202))
+                    {
+                        Location = new Point(startLocation.X + screen.X - startCursor.X, startLocation.Y + screen.Y - startCursor.Y);
+                        if (msg == 0x202) { dragging = false; Capture = false; }
+                    }
+                }
+            }
+            base.WndProc(ref m);
+        }
+    }
+
+    public class SmokeForm : Form
+    {
+        public Button Counter;
+        public EventPanel Pad;
+        public Panel DragArea;
+        public EventPanel Knob;
+        public EventPanel Canvas;
+        public Label Ticker;
+        public Point KnobHome = new Point(10, 20);
+        System.Windows.Forms.Timer timer;
+
+        public static readonly Color CanvasColor = Color.FromArgb(40, 160, 90);
+
+        public SmokeForm(Rectangle bounds)
+        {
+            Text = "TedCat smoke test";
+            StartPosition = FormStartPosition.Manual;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            TopMost = true;
+            Bounds = bounds;
+            BackColor = Color.WhiteSmoke;
+            int w = ClientSize.Width, h = ClientSize.Height;
+
+            Counter = new Button();
+            Counter.Name = "Counter";
+            Counter.Text = "Clicks: 0";
+            Counter.SetBounds(10, 10, 200, 60);
+            Counter.Click += delegate
+            {
+                int n = Interlocked.Increment(ref Ui.Clicks);
+                Counter.Text = "Clicks: " + n;
+                Ui.Log("Counter", "Click", Control.MousePosition);
+            };
+
+            Pad = new EventPanel();
+            Pad.Name = "Pad";
+            Pad.BackColor = Color.Khaki;
+            Pad.SetBounds(220, 10, 200, 60);
+            Pad.MouseDoubleClick += delegate(object sender, MouseEventArgs e) { Ui.Log("Pad", "MouseDoubleClick", Pad.PointToScreen(e.Location)); };
+
+            DragArea = new Panel();
+            DragArea.Name = "DragArea";
+            DragArea.BackColor = Color.LightSteelBlue;
+            DragArea.SetBounds(10, 80, w - 20, 100);
+
+            Knob = new EventPanel();
+            Knob.Name = "Knob";
+            Knob.Draggable = true;
+            Knob.BackColor = Color.OrangeRed;
+            Knob.SetBounds(KnobHome.X, KnobHome.Y, 60, 60);
+            DragArea.Controls.Add(Knob);
+
+            Canvas = new EventPanel();
+            Canvas.Name = "Canvas";
+            Canvas.BackColor = CanvasColor;
+            Canvas.SetBounds(10, 190, w - 20, h - 200);
+
+            // Changes every 100 ms so the recording has moving pixels.
+            Ticker = new Label();
+            Ticker.Name = "Ticker";
+            Ticker.AutoSize = false;
+            Ticker.SetBounds(60, 60, 170, 32);
+            Ticker.BackColor = Color.Black;
+            Ticker.ForeColor = Color.White;
+            Ticker.Font = new Font(FontFamily.GenericMonospace, 14f, FontStyle.Bold);
+            Canvas.Controls.Add(Ticker);
+            timer = new System.Windows.Forms.Timer();
+            timer.Interval = 100;
+            timer.Tick += delegate { Ticker.Text = DateTime.Now.ToString("HH:mm:ss.f"); };
+            timer.Start();
+
+            Controls.Add(Counter);
+            Controls.Add(Pad);
+            Controls.Add(DragArea);
+            Controls.Add(Canvas);
+        }
+
+        public Control Find(string name)
+        {
+            Control[] found = Controls.Find(name, true);
+            return found.Length > 0 ? found[0] : null;
+        }
+    }
+
+    /// The test window, on its own STA thread with its own message loop, so
+    /// the script can sleep and inject input while the window stays responsive.
+    public static class Ui
+    {
+        static readonly object Gate = new object();
+        static readonly List<string> events = new List<string>();
+        static readonly ManualResetEvent ready = new ManualResetEvent(false);
+        static string startError;
+        public static SmokeForm Form;
+        public static int Clicks;
+
+        public static void Log(string who, string what, Point p)
+        {
+            lock (Gate) events.Add(Environment.TickCount + " " + who + " " + what + " " + p.X + "," + p.Y);
+        }
+
+        public static string[] Events() { lock (Gate) return events.ToArray(); }
+        public static void ClearEvents() { lock (Gate) events.Clear(); }
+
+        public static string Start(int x, int y, int width, int height)
+        {
+            Rectangle bounds = new Rectangle(x, y, width, height);
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    Application.EnableVisualStyles();
+                    Form = new SmokeForm(bounds);
+                    Form.Shown += delegate { ready.Set(); };
+                    Application.Run(Form);
+                }
+                catch (Exception e)
+                {
+                    startError = e.ToString();
+                    ready.Set();
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.IsBackground = true;
+            thread.Start();
+            if (!ready.WaitOne(20000)) return "the test window did not appear within 20 s";
+            Thread.Sleep(300);
+            return startError;
+        }
+
+        /// Screen rectangle (l, t, r, b) of a control's client area.
+        public static int[] Rect(string name)
+        {
+            return (int[])Form.Invoke(new Func<int[]>(delegate
+            {
+                Control c = Form.Find(name);
+                Rectangle r = c.RectangleToScreen(c.ClientRectangle);
+                return new int[] { r.Left, r.Top, r.Right, r.Bottom };
+            }));
+        }
+
+        public static void ResetKnob()
+        {
+            Form.Invoke(new Action(delegate { Form.Knob.Location = Form.KnobHome; }));
+        }
+
+        public static void Close()
+        {
+            try { Form.Invoke(new Action(delegate { Form.Close(); })); } catch (Exception) { }
+        }
+    }
+}
+'@
+Add-Type -TypeDefinition $helpers -ReferencedAssemblies System.Windows.Forms, System.Drawing -Language CSharp
+
+# ---------------------------------------------------------------------------
+# Plumbing
+
+$LogPath = Join-Path $env:LOCALAPPDATA 'TedCat\tedcat.log'
+$SettingsPath = Join-Path $env:APPDATA 'TedCat\settings.json'
+$VideosDir = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'TedCat'
+
+$VK_SHIFT = [uint16]0x10; $SC_SHIFT = [uint16]0x2A
+$VK_ESCAPE = [uint16]0x1B; $SC_ESCAPE = [uint16]0x01
+
+$script:Results = New-Object System.Collections.Generic.List[object]
+$script:Notes = New-Object System.Collections.Generic.List[string]
+$script:Ted = $null
+$script:EnvironmentProblem = $null
+$script:ShotCount = 0
+
+function Note([string]$Text) {
+    $script:Notes.Add($Text)
+    Write-Host "    $Text"
+}
+
+function Assert([bool]$Condition, [string]$Message) {
+    if (-not $Condition) { throw $Message }
+}
+
+function Skip([string]$Why) { throw "SKIP: $Why" }
+
+function Save-Desktop([string]$Name) {
+    $script:ShotCount++
+    $path = Join-Path $ArtifactsDir ('{0:D2}-{1}.png' -f $script:ShotCount, $Name)
+    $err = [TedCatSmoke.Win]::Shot($path)
+    if ($err) { Write-Host "    (desktop screenshot failed: $err)" } else { Write-Host "    desktop screenshot: $path" }
+}
+
+function Invoke-Step([string]$Name, [scriptblock]$Body) {
+    Write-Host ''
+    Write-Host "=== $Name ==="
+    $script:Notes = New-Object System.Collections.Generic.List[string]
+    $result = 'passed'
+    $why = $null
+    if ($script:EnvironmentProblem -and $Name -ne 'after-exit') {
+        $result = 'skipped'
+        $why = $script:EnvironmentProblem
+    } else {
+        try {
+            & $Body | Out-Host
+        } catch {
+            $message = $_.Exception.Message
+            if ($message.StartsWith('SKIP: ')) {
+                $result = 'skipped'
+                $why = $message.Substring(6)
+            } else {
+                $result = 'failed'
+                $why = '{0} (script line {1})' -f $message, $_.InvocationInfo.ScriptLineNumber
+            }
+        }
+    }
+    $evidence = @($script:Notes)
+    if ($why) { $evidence = @($why) + $evidence }
+    $script:Results.Add([pscustomobject]@{ Step = $Name; Result = $result; Evidence = ($evidence -join ' | ') })
+    Write-Host ('>>> {0}: {1}' -f $Name, $result.ToUpper())
+    if ($why) { Write-Host "    $why" }
+    if ($result -eq 'failed') { Save-Desktop "failed-$Name" }
+}
+
+function Read-TedLog {
+    if (Test-Path -LiteralPath $LogPath) { return [TedCatSmoke.Win]::ReadShared($LogPath) }
+    return ''
+}
+
+function Get-LogMark { return (Read-TedLog).Length }
+
+function Get-LogSince([int]$Mark) {
+    $text = Read-TedLog
+    if ($text.Length -le $Mark) { return '' }
+    return $text.Substring($Mark)
+}
+
+# Waits for a regex in the log written after $Mark; returns the matching line or $null.
+function Wait-Log([string]$Pattern, [int]$Mark = 0, [int]$TimeoutMs = 10000) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        foreach ($line in ((Get-LogSince $Mark) -split "`r?`n")) {
+            if ($line -match $Pattern) { return $line.Trim() }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($watch.ElapsedMilliseconds -lt $TimeoutMs)
+    return $null
+}
+
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs = 5000) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds 50
+    } while ($watch.ElapsedMilliseconds -lt $TimeoutMs)
+    return [bool](& $Condition)
+}
+
+function Invoke-Input([bool]$Ok, [string]$What) {
+    if (-not $Ok) { throw "SendInput failed during ${What}: $([TedCatSmoke.Input]::LastError)" }
+}
+
+function Center([int[]]$Rect) {
+    return @([int](($Rect[0] + $Rect[2]) / 2), [int](($Rect[1] + $Rect[3]) / 2))
+}
+
+function Get-Events([string]$Control) {
+    return @([TedCatSmoke.Ui]::Events() | Where-Object { ($_ -split ' ')[1] -eq $Control })
+}
+
+# "DOWN UP ..." for a control's button messages (moves left out).
+function Get-ButtonSequence([string]$Control) {
+    $names = @(Get-Events $Control | ForEach-Object { ($_ -split ' ')[2] } | Where-Object { $_ -in @('DOWN', 'UP', 'DBLCLK') })
+    return ($names -join ' ')
+}
+
+function Assert-TedRunning {
+    if ($script:Ted -and $script:Ted.HasExited) {
+        throw ('TedCat exited unexpectedly with code 0x{0:X8}' -f $script:Ted.ExitCode)
+    }
+}
+
+function Wait-Clicks([int]$Expected, [int]$TimeoutMs = 3000) {
+    [void](Wait-Until { [TedCatSmoke.Ui]::Clicks -ge $Expected } $TimeoutMs)
+    # Give a duplicate click time to show up.
+    Start-Sleep -Milliseconds 700
+    return [TedCatSmoke.Ui]::Clicks
+}
+
+function Test-CounterClick([string]$What) {
+    $before = [TedCatSmoke.Ui]::Clicks
+    $c = Center ([TedCatSmoke.Ui]::Rect('Counter'))
+    Invoke-Input ([TedCatSmoke.Input]::Click($c[0], $c[1], 40)) $What
+    $after = Wait-Clicks ($before + 1)
+    Note "counter $before -> $after after one quick click at $($c[0]),$($c[1])"
+    Assert ($after -eq $before + 1) "a quick click on the counter changed it by $($after - $before) instead of exactly 1"
+}
+
+function Clipboard-HasImage {
+    try { return [System.Windows.Forms.Clipboard]::ContainsImage() } catch { return $false }
+}
+
+function Find-FFprobe {
+    $command = Get-Command ffprobe -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    foreach ($candidate in @("$env:ChocolateyInstall\bin\ffprobe.exe", 'C:\ProgramData\chocolatey\bin\ffprobe.exe')) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+function Invoke-Native([string]$File, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { return (& $File @Arguments 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
+}
+
+# ---------------------------------------------------------------------------
+# Steps
+
+$exitCode = 0
+try {
+    Write-Host "TedCat smoke test: $Exe"
+    Write-Host "Artifacts: $ArtifactsDir"
+
+    Invoke-Step 'environment' {
+        Note ("OS: {0} ({1})" -f (Get-CimInstance Win32_OperatingSystem).Caption, [Environment]::OSVersion.VersionString)
+        Note ("PowerShell {0}, apartment {1}, 64-bit {2}" -f $PSVersionTable.PSVersion, [System.Threading.Thread]::CurrentThread.GetApartmentState(), [Environment]::Is64BitProcess)
+        Note ("DPI awareness of this script: {0}; system DPI {1}" -f [TedCatSmoke.Win]::InitDpi(), [TedCatSmoke.Native]::GetDpiForSystem())
+        Note ("session {0}, active console session {1}, input desktop: {2}" -f [System.Diagnostics.Process]::GetCurrentProcess().SessionId, [TedCatSmoke.Native]::WTSGetActiveConsoleSessionId(), [TedCatSmoke.Win]::InputDesktop())
+        $integrity = @((whoami /groups) -match 'Mandatory Label' | ForEach-Object { ($_ -split '\s{2,}')[0] }) -join ','
+        Note ("user: {0}; integrity: {1}" -f [Environment]::UserName, $integrity)
+        $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        Note ("virtual screen {0}x{1} at {2},{3}; primary working area {4}" -f $vs.Width, $vs.Height, $vs.X, $vs.Y, $wa)
+        foreach ($vc in @(Get-CimInstance Win32_VideoController)) { Note ("video: {0} ({1}x{2})" -f $vc.Name, $vc.CurrentHorizontalResolution, $vc.CurrentVerticalResolution) }
+        $sound = @(Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue)
+        Note ("sound devices: {0}" -f $(if ($sound.Count) { ($sound | ForEach-Object { $_.Name }) -join ', ' } else { 'none' }))
+        try {
+            $endpoints = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction Stop | Where-Object { $_.Status -eq 'OK' })
+            Note ("audio endpoints: {0}" -f $(if ($endpoints.Count) { ($endpoints | ForEach-Object { $_.FriendlyName }) -join ', ' } else { 'none' }))
+        } catch { Note "audio endpoints: none ($($_.Exception.Message))" }
+        foreach ($dll in @('mfplat.dll', 'mfreadwrite.dll', 'mfh264enc.dll', 'msmpeg2venc.dll', 'd3d11.dll', 'Windows.Graphics.dll')) {
+            Note ("{0}: {1}" -f $dll, (Test-Path -LiteralPath (Join-Path $env:windir "System32\$dll")))
+        }
+        $ff = Find-FFprobe
+        Note ("ffprobe: {0}" -f $(if ($ff) { $ff } else { 'not found' }))
+        Note ("TedCat.exe: {0} bytes" -f (Get-Item -LiteralPath $Exe).Length)
+        Note ("foreground window: {0}; cursor at {1}" -f [TedCatSmoke.Win]::Foreground(), [TedCatSmoke.Input]::Cursor())
+    }
+
+    Invoke-Step 'baseline' {
+        # Clean slate: no TedCat, no log, settings written so there is no first-run balloon.
+        Get-Process -Name TedCat -ErrorAction SilentlyContinue | Stop-Process -Force
+        Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path (Split-Path $SettingsPath) | Out-Null
+        [System.IO.File]::WriteAllText($SettingsPath, '{"enabled":true,"trigger":"HoldOnly","hold_millis":350,"play_sounds":false,"include_system_audio":true,"recordings_folder":null}')
+        Note "settings: $(Get-Content -Raw -LiteralPath $SettingsPath)"
+
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $startError = [TedCatSmoke.Ui]::Start($wa.X + 20, $wa.Y + 20, [Math]::Min(1000, $wa.Width - 40), [Math]::Min(700, $wa.Height - 40))
+        if ($startError) { throw "test window failed: $startError" }
+        $c = Center ([TedCatSmoke.Ui]::Rect('Counter'))
+        Note ("test window up; counter at {0},{1}; window there: {2}" -f $c[0], $c[1], [TedCatSmoke.Win]::WindowAt($c[0], $c[1]))
+
+        if (-not [TedCatSmoke.Input]::Click($c[0], $c[1], 40)) {
+            $script:EnvironmentProblem = "no interactive input on this desktop: $([TedCatSmoke.Input]::LastError); input desktop $([TedCatSmoke.Win]::InputDesktop())"
+            Skip $script:EnvironmentProblem
+        }
+        Note "cursor after the click: $([TedCatSmoke.Input]::Cursor())"
+        $after = Wait-Clicks 1
+        if ($after -ne 1) {
+            $script:EnvironmentProblem = "SendInput succeeded but the click never reached the test window (count $after, window under the cursor: $([TedCatSmoke.Win]::WindowAt($c[0], $c[1])))"
+            Save-Desktop 'baseline-no-click'
+            Skip $script:EnvironmentProblem
+        }
+        Note 'a SendInput click reaches the test window without TedCat (count 0 -> 1)'
+    }
+
+    Invoke-Step 'start' {
+        Assert (Test-Path -LiteralPath $Exe) "TedCat.exe not found at $Exe"
+        $script:Ted = Start-Process -FilePath $Exe -PassThru
+        Note "started TedCat.exe, pid $($script:Ted.Id)"
+        $line = Wait-Log 'input hook status: (Active|Unavailable.*)' 0 15000
+        if (-not $line) {
+            if ($script:Ted.HasExited) { throw ('TedCat exited during start-up with code 0x{0:X8}; log: {1}' -f $script:Ted.ExitCode, (Read-TedLog)) }
+            throw 'TedCat never reported its input hook status within 15 s'
+        }
+        Note $line
+        $installed = Wait-Log '\[input\] Input hooks installed' 0 3000
+        if ($installed) { Note $installed }
+        if ($line -match 'Unavailable') {
+            $script:EnvironmentProblem = "Windows refused TedCat's low-level hooks on this runner: $line"
+            Skip $script:EnvironmentProblem
+        }
+        Assert-TedRunning
+        Note ("TedCat windows: {0}" -f ([TedCatSmoke.Win]::Windows('TedCat.') -join '; '))
+    }
+
+    Invoke-Step 'replay-click' {
+        Test-CounterClick 'the quick click'
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'replay-double-click' {
+        [TedCatSmoke.Ui]::ClearEvents()
+        $c = Center ([TedCatSmoke.Ui]::Rect('Pad'))
+        Invoke-Input ([TedCatSmoke.Input]::DoubleClick($c[0], $c[1], 30, 70)) 'the double click'
+        [void](Wait-Until { (Get-ButtonSequence 'Pad') -eq 'DOWN UP DBLCLK UP' } 3000)
+        Start-Sleep -Milliseconds 700
+        $sequence = Get-ButtonSequence 'Pad'
+        $doubles = @(Get-Events 'Pad' | Where-Object { $_ -match 'MouseDoubleClick' }).Count
+        Note "pad received: $sequence; MouseDoubleClick events: $doubles"
+        Assert ($sequence -eq 'DOWN UP DBLCLK UP') "expected 'DOWN UP DBLCLK UP' on the pad, got '$sequence'"
+        Assert ($doubles -eq 1) "expected exactly one MouseDoubleClick, got $doubles"
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'replay-drag' {
+        [TedCatSmoke.Ui]::ResetKnob()
+        Start-Sleep -Milliseconds 200
+        [TedCatSmoke.Ui]::ClearEvents()
+        $before = [TedCatSmoke.Ui]::Rect('Knob')
+        $a = Center $before
+        $dx = 200
+        # Moves right away (10 px steps every 10 ms): a normal drag, not a hold.
+        Invoke-Input ([TedCatSmoke.Input]::Drag($a[0], $a[1], $a[0] + $dx, $a[1], 0, 10, 10)) 'the quick drag'
+        Start-Sleep -Milliseconds 800
+        $after = [TedCatSmoke.Ui]::Rect('Knob')
+        $moved = @(($after[0] - $before[0]), ($after[1] - $before[1]))
+        $events = @(Get-Events 'Knob' | ForEach-Object { ($_ -split ' ')[2] })
+        $sequence = (($events | Select-Object -Unique) -join ' ')
+        Note ("knob moved by {0},{1} (expected {2},0); knob saw {3} events: first {4}, last {5}, {6} moves" -f $moved[0], $moved[1], $dx, $events.Count, $(if ($events.Count) { $events[0] } else { '-' }), $(if ($events.Count) { $events[-1] } else { '-' }), @($events | Where-Object { $_ -eq 'MOVE' }).Count)
+        $first = @(Get-Events 'Knob') | Select-Object -First 1
+        if ($first) { Note "first knob event: $first (press was at $($a[0]),$($a[1]))" }
+        Assert ($events.Count -ge 3 -and $events[0] -eq 'DOWN' -and $events[-1] -eq 'UP') "expected DOWN, MOVE..., UP on the knob, got '$($events -join ' ')'"
+        Assert (@($events | Where-Object { $_ -eq 'DOWN' }).Count -eq 1 -and @($events | Where-Object { $_ -eq 'UP' }).Count -eq 1) "expected exactly one DOWN and one UP, got '$sequence'"
+        Assert (@($events | Where-Object { $_ -eq 'MOVE' }).Count -ge 1) 'no MOVE between DOWN and UP'
+        Assert ([Math]::Abs($moved[0] - $dx) -le 2 -and [Math]::Abs($moved[1]) -le 2) "the knob moved by $($moved[0]),$($moved[1]) instead of $dx,0"
+        [TedCatSmoke.Ui]::ResetKnob()
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'screenshot' {
+        Assert ([TedCatSmoke.Clip]::Clear()) 'could not clear the clipboard'
+        Assert (-not (Clipboard-HasImage)) 'the clipboard still holds an image after clearing it'
+        [TedCatSmoke.Ui]::ClearEvents()
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $w = 320; $h = 200
+        $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
+        $x2 = $x1 + $w; $y2 = $y1 + $h
+        $mark = Get-LogMark
+        Invoke-Input ([TedCatSmoke.Input]::Drag($x1, $y1, $x2, $y2, 600, 20, 15)) 'the screenshot gesture'
+        $hasImage = Wait-Until { Clipboard-HasImage } 5000
+        $line = Wait-Log 'screenshot \d+x\d+ copied|screenshot failed' $mark 2000
+        Note "log: $(if ($line) { $line } else { '(no screenshot line)' })"
+        Note ("clipboard formats: {0}; owner pid {1} (TedCat {2})" -f ([TedCatSmoke.Clip]::Formats() -join ', '), [TedCatSmoke.Clip]::OwnerPid(), $script:Ted.Id)
+        Assert $hasImage 'no image on the clipboard within 5 s of the release'
+        $image = [System.Windows.Forms.Clipboard]::GetImage()
+        Assert ($null -ne $image) 'Clipboard.GetImage() returned nothing'
+        Note ("Clipboard.GetImage(): {0}x{1} (expected {2}x{3})" -f $image.Width, $image.Height, $w, $h)
+        Assert ([Math]::Abs($image.Width - $w) -le 2 -and [Math]::Abs($image.Height - $h) -le 2) "image is $($image.Width)x$($image.Height), expected about ${w}x${h}"
+        $png = [TedCatSmoke.Clip]::PngSize()
+        Note "PNG format: $(if ($png) { $png } else { 'missing' })"
+        Assert ($null -ne $png) 'the registered "PNG" clipboard format is missing'
+        Assert ($png -eq "$($image.Width)x$($image.Height)") "PNG is $png but the bitmap is $($image.Width)x$($image.Height)"
+        # The selection's middle is plain canvas: the overlay's dimming must not be in the picture.
+        $pixel = $image.GetPixel([int]($image.Width / 2), [int]($image.Height * 3 / 4))
+        $expected = [TedCatSmoke.SmokeForm]::CanvasColor
+        Note ("pixel in the image: {0},{1},{2} (canvas is {3},{4},{5})" -f $pixel.R, $pixel.G, $pixel.B, $expected.R, $expected.G, $expected.B)
+        $image.Save((Join-Path $ArtifactsDir 'screenshot-from-clipboard.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $image.Dispose()
+        Assert ([Math]::Abs($pixel.R - $expected.R) -le 8 -and [Math]::Abs($pixel.G - $expected.G) -le 8 -and [Math]::Abs($pixel.B - $expected.B) -le 8) 'the screenshot does not show the canvas colour (overlay captured, or a black/blank capture)'
+        $leaked = @(Get-Events 'Canvas' | Where-Object { $_ -match ' (DOWN|UP|DBLCLK) ' })
+        Note "button messages that reached the window under the selection: $($leaked.Count)"
+        Assert ($leaked.Count -eq 0) "the held press leaked to the window underneath: $($leaked -join '; ')"
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'recording' {
+        $existing = @()
+        if (Test-Path -LiteralPath $VideosDir) { $existing = @(Get-ChildItem -LiteralPath $VideosDir -Filter *.mp4 | ForEach-Object { $_.FullName }) }
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $w = [Math]::Min(480, $canvas[2] - $canvas[0] - 60); $w -= $w % 2
+        $h = [Math]::Min(320, $canvas[3] - $canvas[1] - 60); $h -= $h % 2
+        Assert ($w -ge 400 -and $h -ge 300) "the screen is too small for a 400x300 recording region (canvas $($canvas -join ','))"
+        $x1 = $canvas[0] + 30; $y1 = $canvas[1] + 30
+        $x2 = $x1 + $w; $y2 = $y1 + $h
+        $mark = Get-LogMark
+        Invoke-Input ([TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $false)) 'Shift down'
+        Start-Sleep -Milliseconds 80
+        $dragged = [TedCatSmoke.Input]::Drag($x1, $y1, $x2, $y2, 600, 24, 15)
+        Start-Sleep -Milliseconds 80
+        $released = [TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $true)
+        Invoke-Input ($dragged -and $released) 'the recording gesture'
+        Note "Shift + hold + drag from $x1,$y1 to $x2,$y2 (${w}x${h})"
+
+        $script:hud = $null
+        [void](Wait-Until { $script:hud = [TedCatSmoke.Win]::FindVisible('TedCat.Hud'); ($null -ne $script:hud) -or [bool]((Get-LogSince $mark) -match 'recording could not start|too small to record') } 20000)
+        $startLine = Wait-Log 'starting region recording.*' $mark 500
+        if ($startLine) { Note $startLine }
+        foreach ($l in @((Get-LogSince $mark) -split "`r?`n" | Where-Object { $_ -match 'sink writer|D3D11|WARP|capture|without system audio|audio' })) { Note ("log: " + $l.Trim()) }
+        $failure = Wait-Log 'recording could not start: .*|too small to record' $mark 200
+        if ($failure) { throw "TedCat did not start recording: $failure" }
+        Assert ($null -ne $script:hud) 'no recording pill (TedCat.Hud) appeared within 20 s'
+        Note ("recording pill at {0}" -f ($script:hud -join ','))
+        Note ("TedCat windows: {0}" -f ([TedCatSmoke.Win]::Windows('TedCat.') -join '; '))
+        Save-Desktop 'recording-in-progress'
+
+        Start-Sleep -Seconds $RecordSeconds
+        $pill = [TedCatSmoke.Win]::FindVisible('TedCat.Hud')
+        Assert ($null -ne $pill) 'the recording pill disappeared before it was clicked'
+        $p = Center $pill
+        Note ("window at the pill centre: {0}" -f [TedCatSmoke.Win]::WindowAt($p[0], $p[1]))
+        Invoke-Input ([TedCatSmoke.Input]::Click($p[0], $p[1], 40)) 'the click on the pill'
+        $stopLine = Wait-Log 'stopping the recording' $mark 5000
+        Assert ($null -ne $stopLine) 'clicking the pill did not stop the recording (no "stopping the recording" in the log)'
+        $saved = Wait-Log 'saved .* bytes|recording failed: .*' $mark 30000
+        Assert ($null -ne $saved) 'the recording was not finalized within 30 s'
+        Note $saved
+        Assert ($saved -notmatch 'recording failed') "TedCat could not save the recording: $saved"
+        $noAudio = Wait-Log 'recording without system audio.*' $mark 100
+        if ($noAudio) { Note "no audio device, as expected on a runner: $noAudio" } else { Note 'TedCat recorded with system audio' }
+
+        $new = @(Get-ChildItem -LiteralPath $VideosDir -Filter *.mp4 | Where-Object { $existing -notcontains $_.FullName })
+        Assert ($new.Count -eq 1) "expected one new .mp4 in $VideosDir, found $($new.Count)"
+        $file = $new[0]
+        Note ("{0}: {1} bytes" -f $file.Name, $file.Length)
+        Assert ($file.Length -gt 0) 'the recording is empty'
+        Copy-Item -LiteralPath $file.FullName -Destination $ArtifactsDir
+
+        $ffprobe = Find-FFprobe
+        if (-not $ffprobe) {
+            Note 'ffprobe not available: stream checks SKIPPED'
+        } else {
+            $json = Invoke-Native $ffprobe @('-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height,duration:format=duration,format_name', '-of', 'json', $file.FullName)
+            $info = $json | ConvertFrom-Json
+            $video = @($info.streams | Where-Object { $_.codec_type -eq 'video' })
+            $audio = @($info.streams | Where-Object { $_.codec_type -eq 'audio' })
+            Assert ($video.Count -eq 1) "expected one video stream, ffprobe says: $json"
+            $duration = [double]$info.format.duration
+            Note ("ffprobe: {0}, video {1} {2}x{3}, {4} audio stream(s){5}, duration {6:N2} s" -f $info.format.format_name, $video[0].codec_name, $video[0].width, $video[0].height, $audio.Count, $(if ($audio.Count) { " ($($audio[0].codec_name))" } else { '' }), $duration)
+            Assert ($video[0].codec_name -eq 'h264') "video codec is $($video[0].codec_name), expected h264"
+            Assert ([int]$video[0].width -eq $w -and [int]$video[0].height -eq $h) "video is $($video[0].width)x$($video[0].height), expected ${w}x${h}"
+            Assert (([int]$video[0].width % 2) -eq 0 -and ([int]$video[0].height % 2) -eq 0) 'odd video dimensions'
+            Assert ($duration -ge ($RecordSeconds - 0.5) -and $duration -le ($RecordSeconds + 6)) "duration $duration s is far from the ~$RecordSeconds s recorded"
+            if ($noAudio) { Assert ($audio.Count -eq 0) 'TedCat said there is no audio, but the file has an audio stream' }
+        }
+        # The saved card replaces the pill.
+        $card = Wait-Until { $null -ne [TedCatSmoke.Win]::FindVisible('TedCat.Card') } 3000
+        Note ("saved card shown: {0}" -f $card)
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'kill-switch' {
+        $mark = Get-LogMark
+        for ($i = 0; $i -lt 3; $i++) {
+            Invoke-Input ([TedCatSmoke.Input]::Tap($VK_ESCAPE, $SC_ESCAPE, 30)) 'Escape'
+            Start-Sleep -Milliseconds 150
+        }
+        $switch = Wait-Log 'Emergency switch.*' $mark 3000
+        $status = Wait-Log 'input hook status: KillSwitch' $mark 3000
+        Note "log: $(if ($switch) { $switch } else { '(no emergency switch line)' })"
+        Note "log: $(if ($status) { $status } else { '(no KillSwitch status line)' })"
+        Assert ($null -ne $switch -and $null -ne $status) 'Escape x3 did not trip the emergency switch'
+
+        Assert ([TedCatSmoke.Clip]::Clear()) 'could not clear the clipboard'
+        [TedCatSmoke.Ui]::ClearEvents()
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
+        $mark = Get-LogMark
+        Invoke-Input ([TedCatSmoke.Input]::Drag($x1, $y1, $x1 + 320, $y1 + 200, 600, 20, 15)) 'the hold + drag after the kill switch'
+        Start-Sleep -Seconds 3
+        $hasImage = Clipboard-HasImage
+        $shot = Wait-Log 'screenshot \d+x\d+ copied' $mark 100
+        $sequence = Get-ButtonSequence 'Canvas'
+        Note ("after hold + drag: clipboard image {0}, formats [{1}], canvas got '{2}'" -f $hasImage, ([TedCatSmoke.Clip]::Formats() -join ', '), $sequence)
+        Assert (-not $hasImage -and -not $shot) 'a screenshot was taken although the gesture is off'
+        Assert ($sequence -eq 'DOWN UP') "with the gesture off the press must pass straight through; the canvas got '$sequence'"
+        Test-CounterClick 'the click after the kill switch'
+        Assert-TedRunning
+    }
+
+    Invoke-Step 'after-exit' {
+        if (-not $script:Ted) { Skip 'TedCat was never started' }
+        if (-not $script:Ted.HasExited) {
+            Stop-Process -Id $script:Ted.Id -Force
+            $script:Ted.WaitForExit(10000) | Out-Null
+        }
+        Note ('TedCat stopped (exit code 0x{0:X8})' -f $script:Ted.ExitCode)
+        if ($script:EnvironmentProblem) { Skip $script:EnvironmentProblem }
+        Test-CounterClick 'the click after TedCat exited'
+    }
+} catch {
+    Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
+    $script:Results.Add([pscustomobject]@{ Step = 'script'; Result = 'failed'; Evidence = $_.Exception.Message })
+    Save-Desktop 'aborted'
+} finally {
+    if ($script:Ted -and -not $script:Ted.HasExited) {
+        Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+    }
+    Get-Process -Name TedCat -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    [TedCatSmoke.Ui]::Close()
+    Save-Desktop 'final'
+
+    Write-Host ''
+    Write-Host '=== TedCat log ==='
+    $log = Read-TedLog
+    Write-Host $log
+    if (Test-Path -LiteralPath $LogPath) { Copy-Item -LiteralPath $LogPath -Destination $ArtifactsDir -Force }
+
+    Write-Host ''
+    Write-Host '=== Summary ==='
+    $script:Results | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
+    $script:Results | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $ArtifactsDir 'summary.json') -Encoding UTF8
+    if ($env:GITHUB_STEP_SUMMARY) {
+        $md = New-Object System.Text.StringBuilder
+        [void]$md.AppendLine('### TedCat smoke test')
+        [void]$md.AppendLine('')
+        [void]$md.AppendLine('| Step | Result | Evidence |')
+        [void]$md.AppendLine('|------|--------|----------|')
+        foreach ($r in $script:Results) {
+            [void]$md.AppendLine(('| {0} | {1} | {2} |' -f $r.Step, $r.Result.ToUpper(), ($r.Evidence -replace '\|', '/' -replace "`r?`n", ' ')))
+        }
+        Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $md.ToString() -Encoding UTF8
+    }
+    $failed = @($script:Results | Where-Object { $_.Result -eq 'failed' })
+    if ($failed.Count -gt 0) {
+        Write-Host ("FAILED: {0}" -f (($failed | ForEach-Object { $_.Step }) -join ', '))
+        $exitCode = 1
+    } else {
+        Write-Host 'No step failed.'
+    }
+}
+exit $exitCode
