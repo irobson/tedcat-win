@@ -29,12 +29,12 @@ No hotkey to remember, no installer, no account, no network access.
 
 - **Press-and-hold to capture.** Hold the left mouse button still for a moment anywhere, then drag out the area you want.
 - **Screenshots straight to the clipboard,** as an image and as PNG, so they paste into Paint, Word, browsers, Slack, Teams and Discord. Nothing is written to disk.
-- **Area screen recording** with the computer's audio, saved automatically as an H.264 MP4 at the screen's native resolution.
+- **Area screen recording** with the computer's audio, saved automatically as an H.264 MP4 at the screen's native resolution (areas larger than 4096 x 2304, such as a full 5K screen, are scaled down to fit H.264).
 - **Audio-only recording** of everything the computer plays, such as the other people in a Zoom, Meet or Teams call. Handy for meeting notes and transcription.
 - **Discreet controls.** A red outline marks the recorded area; a small pill with a timer sits in the screen corner farthest from it. One click stops and saves.
 - **A card after every recording** with the file name, folder, size, length and a thumbnail. Click to play, drag the thumbnail into another app, or show it in Explorer.
 - **Clean output.** TedCat's own overlay, outline, pill and card never appear in screenshots or videos.
-- **Ordinary clicks are untouched.** Quick clicks, double clicks, drags, Ctrl/Shift-clicks and right clicks reach your apps as usual.
+- **Ordinary clicks keep working.** Quick clicks, double clicks, drags, Ctrl/Shift-clicks and right clicks reach your apps as usual, with Ctrl, Shift, Alt and Win where you pressed them. Left-handed (swapped) mouse buttons are supported.
 - **Light.** One small executable, no dependencies, no background services.
 
 ## Install
@@ -53,7 +53,7 @@ TedCat needs no special permission on Windows.
 
 ### Screenshot
 
-1. Press the left mouse button and keep it **still** for about a third of a second.
+1. Press the left mouse button and keep it **still** for about a third of a second. (With the buttons swapped for left-handed use, hold your primary button, the right one.)
 2. The screen dims. Drag to size the area; a label shows its size. Press **Esc** to cancel.
 3. Release. The area flashes and the image is on the clipboard. Paste it with **Ctrl+V**.
 
@@ -66,6 +66,8 @@ TedCat needs no special permission on Windows.
 5. Click the pill, or choose **Stop Recording** in the tray menu, to stop. The file is saved and a card shows where.
 
 Releasing without dragging, or on an area too small to film, does nothing.
+
+If the display resolution or orientation changes while recording, TedCat stops the recording and keeps what it recorded until then. If you sign out, restart or shut down while recording, TedCat saves the recording first; Windows shows "Saving a recording" for TedCat on its shutdown screen meanwhile.
 
 ### Record audio only, for example a meeting
 
@@ -81,7 +83,7 @@ Recordings are saved to `Videos\TedCat` with names like `TedCat 2026-10-30 at 14
 
 | Recording   | Format |
 |-------------|--------|
-| Video       | H.264 in MP4, native resolution, 30 fps, 2 to 9 Mbps depending on the area |
+| Video       | H.264 in MP4, native resolution up to 4096 x 2304 (larger areas are scaled down), 30 fps, 2 to 9 Mbps depending on the area |
 | Video audio | AAC, 48 kHz stereo, 128 kbps |
 | Audio only  | AAC in M4A, 48 kHz stereo, 128 kbps, about 1 MB per minute |
 
@@ -104,7 +106,7 @@ ffmpeg -i "TedCat 2026-10-30 at 14.03.22.m4a" -ac 1 -ar 16000 audio.wav
 | Include System Audio in Videos | Add the computer's audio to area recordings |
 | Open Recordings Folder / Change Recordings Folder… | Where recordings are saved |
 | Open Log File | TedCat's log, useful when something does not work |
-| Quit TedCat | Stops TedCat; a running recording is saved first |
+| Quit TedCat | Stops TedCat; a running recording is saved first, and a press TedCat is holding goes back to the app |
 
 Settings are stored in `%APPDATA%\TedCat\settings.json`.
 
@@ -113,6 +115,8 @@ Settings are stored in `%APPDATA%\TedCat\settings.json`.
 To tell a hold from a click, TedCat briefly holds back each left-button press and hands it back to the app underneath if you release or move. If anything goes wrong, TedCat is designed to stop intercepting rather than to lose clicks:
 
 - If Windows refuses to hand a click back, TedCat turns the gesture off at once and tells you.
+- If you press or release Shift, Ctrl, Alt or Win while holding the button and then type, scroll or press another button, TedCat hands the press back at once, so everything reaches the app in the order you did it.
+- While TedCat quits or Windows signs you out, it holds no new presses; a selection on screen is closed and its press handed back to the app.
 - Clicks on windows of programs running as administrator are never held, because Windows would not let TedCat hand them back.
 - Clicks on TedCat's own pill and card are never held.
 - If Windows removes TedCat's input hook, it notices and reinstalls it cleanly.
@@ -124,10 +128,10 @@ If clicks ever misbehave, press Esc three times, or end TedCat from Task Manager
 ## Troubleshooting
 
 **A yellow border appears around the screen while recording.**
-Windows draws it during screen capture unless borderless capture is allowed. On Windows 11 TedCat requests a borderless capture; Windows 10 always shows the border. The border is not part of the video.
+Windows draws it during screen capture. TedCat always asks Windows to leave it off. Windows 11 does so when desktop apps are allowed to turn the screenshot border off (Settings › Privacy & security › Screenshot borders, on versions that have that page); Windows 10 always shows the border. The border is not part of the video.
 
-**Recording says Media Foundation is missing.**
-Windows "N" editions ship without media components. Install the Media Feature Pack from Settings › Apps › Optional features. Screenshots work without it.
+**Recording says "Recording needs Windows Media Foundation (install the Media Feature Pack)."**
+Windows "N" and "KN" editions ship without media components. TedCat still starts there, and the hold gesture and screenshots work; only recording needs them. Install the **Media Feature Pack** from Optional features in Settings (search Settings for "Optional features", then View features / Add a feature), restart Windows if it asks, and record again.
 
 **Recordings have no sound.**
 TedCat records the default playback device. Check that a playback device exists and that **Include System Audio in Videos** is on.
