@@ -37,10 +37,11 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use crate::geom::{MonitorInfo, PointPx};
 use layout::Corner;
 
-/// Private notification from TedCat's own windows (pill, card) to the main
-/// window. `WPARAM`: a [`UiAction`] code; `LPARAM`: the sender's generation
-/// number, so actions from a window that has since been replaced are ignored.
-/// No payload is boxed, so nothing leaks if the message is dropped.
+/// Private notification from TedCat's own windows (pill, card) to TedCat's
+/// message-only window (`TedCat.Msg`, which broadcasts never reach).
+/// `WPARAM`: a [`UiAction`] code; `LPARAM`: the sender's generation number, so
+/// actions from a window that has since been replaced are ignored. No payload
+/// is boxed, so nothing leaks if the message is dropped.
 pub(crate) const WM_APP_UI: u32 = WM_APP + 0x40;
 
 /// What the user did in one of TedCat's windows.
@@ -80,10 +81,11 @@ impl UiAction {
     }
 }
 
-/// Posts `action` from the window with `generation` to the main window.
-pub(crate) fn post_action(main: HWND, action: UiAction, generation: u32) {
+/// Posts `action` from the window with `generation` to `notify` (the window
+/// the pill or card was shown for: TedCat's message-only window).
+pub(crate) fn post_action(notify: HWND, action: UiAction, generation: u32) {
     // SAFETY: plain PostMessageW with integer parameters.
-    let posted = unsafe { PostMessageW(Some(main), WM_APP_UI, WPARAM(action.code()), LPARAM(generation as isize)) };
+    let posted = unsafe { PostMessageW(Some(notify), WM_APP_UI, WPARAM(action.code()), LPARAM(generation as isize)) };
     if let Err(error) = posted {
         crate::log_warn!("could not post {action:?}: {error}");
     }

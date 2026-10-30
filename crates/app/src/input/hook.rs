@@ -41,6 +41,9 @@
 //!   any selection) and log it.
 //! - Post `HookStatus::Active` once installed, or `Unavailable` on failure.
 //! - `stop` unhooks, ends the thread and joins it.
+//! - `handle` gives the UI a `messages::HookHandle`. When the UI will not show
+//!   a selection (the overlay failed, or TedCat is quitting) it sends
+//!   `WM_HOOK_SELECTION_REFUSED`, and the held press goes back to the app.
 //!
 //! Implementation notes:
 //! - The decisions live in the Win32-free [`logic`] submodule; this file is the
@@ -83,7 +86,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetMessageW, GetSystemMetrics,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos, GetMessageW, GetSystemMetrics,
     GetWindowThreadProcessId, KillTimer, PeekMessageW, PostThreadMessageW, SetTimer, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
     MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -97,7 +100,10 @@ use self::logic::{
     Command, HookLogic, IntegrityCache, LogLevel, PressContext, ReplayAction, ReplayEvent, Throttled, UpdateThrottle,
 };
 use crate::geom::{MonitorInfo, PointPx};
-use crate::messages::{GestureEvent, HookStatus, UiHandle, WM_APP_GESTURE, WM_APP_HOOK_STATUS};
+use crate::messages::{
+    unpack_point, GestureEvent, HookHandle, HookStatus, UiHandle, WM_APP_GESTURE, WM_APP_HOOK_STATUS,
+    WM_HOOK_SELECTION_REFUSED,
+};
 use crate::util::win::CLASS_PREFIX;
 
 /// Marks every input event TedCat injects ("TCAT").
@@ -168,6 +174,12 @@ impl InputHook {
                 Err(std::io::Error::other("the input hook thread exited during start-up"))
             }
         }
+    }
+
+    /// A handle for the UI thread's requests to the hook thread (see
+    /// [`HookHandle`]); valid until [`InputHook::stop`].
+    pub fn handle(&self) -> HookHandle {
+        HookHandle::new(self.thread_id)
     }
 
     /// Removes the hooks and joins the thread. Any held press is dropped.
@@ -545,6 +557,11 @@ impl HookThread {
                     let _ = KillTimer(None, id);
                 }
             }
+        } else if msg.message == WM_HOOK_SELECTION_REFUSED {
+            // The UI will not show this selection (overlay failed, or TedCat is
+            // quitting): hand the press back instead of swallowing the release.
+            let origin = unpack_point(msg.wParam, msg.lParam);
+            self.logic.selection_refused(origin, cursor_position().unwrap_or(origin));
         }
         // WM_HOOK_WAKE needs nothing more than this.
         self.run_commands();
@@ -850,6 +867,13 @@ unsafe fn token_integrity(process: HANDLE) -> Option<u32> {
             Some(*rid)
         }
     }
+}
+
+/// The pointer position in physical pixels (the process is per-monitor DPI aware).
+fn cursor_position() -> Option<PointPx> {
+    let mut point = POINT::default();
+    // SAFETY: writes into a local POINT.
+    unsafe { GetCursorPos(&mut point) }.ok().map(|()| PointPx::new(point.x, point.y))
 }
 
 fn key_down(key: VIRTUAL_KEY) -> bool {

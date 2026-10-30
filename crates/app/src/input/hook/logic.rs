@@ -286,6 +286,29 @@ impl HookLogic {
         self.log(LogLevel::Warn, "The UI did not accept the start of a selection; the press was passed through.".to_owned());
     }
 
+    /// The UI will not show the selection that began at `origin` (its overlay
+    /// could not be created, or TedCat is quitting): hand the press back to the
+    /// app, as the held press at `origin` followed by a move to `current`, so a
+    /// press-and-hold or a slow drag still reaches it and the release passes.
+    /// Ignored unless that selection is still in progress, so a late request
+    /// never touches a later gesture.
+    pub fn selection_refused(&mut self, origin: PointPx, current: PointPx) {
+        let ours = matches!(
+            self.recognizer.state(),
+            State::Selecting { origin: began, .. } if point_px(began) == origin
+        );
+        if !ours {
+            return;
+        }
+        self.release_held();
+        if current != origin {
+            self.enqueue(ReplayEvent::new(current, ReplayAction::Move));
+        }
+        self.held = None;
+        self.recognizer.reset();
+        self.log(LogLevel::Warn, "The UI did not show the selection; the press was passed through.".to_owned());
+    }
+
     /// `SendInput` refused (part of) a replay. Fail open: stop holding presses
     /// at once and tell the user.
     pub fn replay_failed(&mut self, reason: String) {
@@ -892,6 +915,46 @@ mod tests {
         logic.begin_failed();
         assert_eq!(logic.take_replays(), vec![down(ORIGIN)]);
         assert!(logic.is_idle());
+    }
+
+    #[test]
+    fn a_selection_the_ui_refused_gives_the_press_back() {
+        let mut logic = HookLogic::new();
+        logic.left_down(ORIGIN, &ctx());
+        logic.hold_timeout(true);
+        let dragged = PointPx::new(180, 140);
+        logic.moved(dragged);
+        commands(&mut logic);
+        // A request for another origin belongs to an earlier gesture: ignored.
+        logic.selection_refused(PointPx::new(5, 5), dragged);
+        assert!(!logic.has_queued_replays());
+        assert!(!logic.is_idle());
+
+        logic.selection_refused(ORIGIN, dragged);
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN), ReplayEvent::new(dragged, ReplayAction::Move)]);
+        assert!(commands(&mut logic).contains(&Command::Wake));
+        assert!(logic.is_idle());
+        assert_eq!(logic.held(), None);
+        // The rest of the drag and the release reach the app.
+        logic.moved(PointPx::new(200, 150));
+        assert!(!logic.left_up(PointPx::new(200, 150)));
+        assert!(!logic.has_queued_replays());
+        // A duplicate request changes nothing.
+        logic.selection_refused(ORIGIN, dragged);
+        assert!(!logic.has_queued_replays());
+    }
+
+    #[test]
+    fn refusing_a_selection_never_touches_a_pending_press() {
+        let mut logic = HookLogic::new();
+        assert!(logic.left_down(ORIGIN, &ctx()));
+        logic.selection_refused(ORIGIN, ORIGIN);
+        assert!(!logic.has_queued_replays());
+        assert_eq!(logic.held(), Some(ORIGIN));
+        // Refused at the press point itself: no extra move is replayed.
+        logic.hold_timeout(true);
+        logic.selection_refused(ORIGIN, ORIGIN);
+        assert_eq!(logic.take_replays(), vec![down(ORIGIN)]);
     }
 
     #[test]

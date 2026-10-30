@@ -1384,6 +1384,474 @@ try {
             Test-CounterClick "the click after TedCat died while the press was $phase" $false
         }
     }
+
+    # -----------------------------------------------------------------------
+    # UI fixes (ci/fix-ui): foreign WM_APP messages, quitting while a
+    # recording is saved, and the end of the session with a recording.
+    # Each step starts its own TedCat and leaves it stopped.
+    #
+    #   foreign-app-messages        WM_APP+1..3 with junk WPARAM/LPARAM posted
+    #                               to TedCat.Main (exactly what an
+    #                               HWND_BROADCAST delivers to it) and to the
+    #                               message-only TedCat.Msg are ignored; TedCat
+    #                               survives and a screenshot still works.
+    #   quit-while-saving           with the recorder thread suspended, the
+    #                               quit waits for the save: a press pending
+    #                               when the quit starts is handed back, and a
+    #                               press-and-hold drag during the wait passes
+    #                               straight through; the file is complete.
+    #   session-end-saves-recording WM_QUERYENDSESSION starts the save at once
+    #                               and sets a shutdown block reason; when
+    #                               WM_ENDSESSION returns (and TedCat is killed
+    #                               like Windows does) the MP4 is complete.
+    #   session-end-during-quit     a WM_ENDSESSION that arrives while a quit
+    #                               is still saving waits for that save.
+
+    $uiFixHelpers = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace TedCatSmokeUiFix
+{
+    public static class Native
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hwnd, uint msg, UIntPtr wparam, IntPtr lparam);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool ShutdownBlockReasonQuery(IntPtr hwnd, StringBuilder buffer, ref uint size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenThread(uint access, bool inherit, uint id);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint SuspendThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll")]
+        public static extern int GetThreadDescription(IntPtr thread, out IntPtr description);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr LocalFree(IntPtr memory);
+    }
+
+    /// One SendMessageTimeout on a background thread, so the script can see
+    /// whether the receiver has answered yet.
+    public class PendingSend
+    {
+        public volatile bool Done;
+        public bool Ok;
+        public long Result;
+        public int Error;
+        public long ElapsedMs;
+        readonly Thread thread;
+
+        public PendingSend(IntPtr hwnd, uint msg, ulong wparam, long lparam, uint timeoutMs)
+        {
+            thread = new Thread(delegate()
+            {
+                Stopwatch watch = Stopwatch.StartNew();
+                UIntPtr result;
+                IntPtr ok = Native.SendMessageTimeout(hwnd, msg, new UIntPtr(wparam), new IntPtr(lparam), 0, timeoutMs, out result);
+                Error = Marshal.GetLastWin32Error();
+                ElapsedMs = watch.ElapsedMilliseconds;
+                Result = (long)result.ToUInt64();
+                Ok = ok != IntPtr.Zero;
+                Done = true;
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        public bool Wait(int timeoutMs) { return thread.Join(timeoutMs); }
+
+        public override string ToString()
+        {
+            if (!Done) return "no answer yet";
+            if (Ok) return "answered " + Result + " after " + ElapsedMs + " ms";
+            return "failed (error " + Error + ") after " + ElapsedMs + " ms";
+        }
+    }
+
+    public static class Session
+    {
+        const uint THREAD_SUSPEND_RESUME = 0x0002;
+        const uint THREAD_QUERY_LIMITED_INFORMATION = 0x0800;
+
+        /// The message-only window of class `cls` (parent HWND_MESSAGE), or zero.
+        public static IntPtr MessageWindow(string cls)
+        {
+            return Native.FindWindowEx(new IntPtr(-3), IntPtr.Zero, cls, null);
+        }
+
+        /// PostMessage; null on success, otherwise the error.
+        public static string Post(IntPtr hwnd, uint msg, ulong wparam, long lparam)
+        {
+            if (Native.PostMessage(hwnd, msg, new UIntPtr(wparam), new IntPtr(lparam))) return null;
+            return "PostMessage failed with error " + Marshal.GetLastWin32Error();
+        }
+
+        public static PendingSend SendAsync(IntPtr hwnd, uint msg, ulong wparam, long lparam, uint timeoutMs)
+        {
+            return new PendingSend(hwnd, msg, wparam, lparam, timeoutMs);
+        }
+
+        public static PendingSend Send(IntPtr hwnd, uint msg, ulong wparam, long lparam, uint timeoutMs)
+        {
+            PendingSend send = new PendingSend(hwnd, msg, wparam, lparam, timeoutMs);
+            send.Wait((int)timeoutMs + 5000);
+            return send;
+        }
+
+        /// The shutdown block reason of a window, as far as this process can read it.
+        public static string BlockReason(IntPtr hwnd)
+        {
+            uint size = 0;
+            if (!Native.ShutdownBlockReasonQuery(hwnd, null, ref size)) return "(none readable, error " + Marshal.GetLastWin32Error() + ")";
+            StringBuilder text = new StringBuilder((int)size + 1);
+            size = (uint)text.Capacity;
+            if (!Native.ShutdownBlockReasonQuery(hwnd, text, ref size)) return "(unreadable, error " + Marshal.GetLastWin32Error() + ")";
+            return text.ToString();
+        }
+
+        static string Describe(IntPtr thread)
+        {
+            IntPtr text;
+            if (Native.GetThreadDescription(thread, out text) < 0 || text == IntPtr.Zero) return null;
+            string name = Marshal.PtrToStringUni(text);
+            Native.LocalFree(text);
+            return name;
+        }
+
+        public static string ThreadNames(int pid)
+        {
+            List<string> names = new List<string>();
+            foreach (ProcessThread t in Process.GetProcessById(pid).Threads)
+            {
+                IntPtr h = Native.OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, (uint)t.Id);
+                if (h == IntPtr.Zero) continue;
+                string name = Describe(h);
+                Native.CloseHandle(h);
+                if (!string.IsNullOrEmpty(name)) names.Add(name);
+            }
+            return string.Join(", ", names.ToArray());
+        }
+
+        /// Suspends the thread of process `pid` whose description is exactly
+        /// `name`. Returns its handle (give it to Resume), or zero.
+        public static IntPtr SuspendNamed(int pid, string name)
+        {
+            foreach (ProcessThread t in Process.GetProcessById(pid).Threads)
+            {
+                IntPtr h = Native.OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, false, (uint)t.Id);
+                if (h == IntPtr.Zero) continue;
+                if (Describe(h) == name && Native.SuspendThread(h) != 0xFFFFFFFF) return h;
+                Native.CloseHandle(h);
+            }
+            return IntPtr.Zero;
+        }
+
+        /// Resumes and closes a thread from SuspendNamed (zero is ignored).
+        public static bool Resume(IntPtr thread)
+        {
+            if (thread == IntPtr.Zero) return false;
+            bool ok = Native.ResumeThread(thread) != 0xFFFFFFFF;
+            Native.CloseHandle(thread);
+            return ok;
+        }
+
+        /// The top-level boxes of an MP4 file ("ftyp mdat moov"), with
+        /// "(truncated)" when a box runs past the end of the file.
+        public static string Mp4Boxes(string path)
+        {
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long length = file.Length, offset = 0;
+                    List<string> boxes = new List<string>();
+                    byte[] header = new byte[16];
+                    while (offset + 8 <= length)
+                    {
+                        file.Seek(offset, SeekOrigin.Begin);
+                        int read = file.Read(header, 0, 16);
+                        if (read < 8) break;
+                        long size = ((long)header[0] << 24) | ((long)header[1] << 16) | ((long)header[2] << 8) | header[3];
+                        boxes.Add(Encoding.ASCII.GetString(header, 4, 4));
+                        if (size == 1 && read >= 16)
+                        {
+                            size = 0;
+                            for (int i = 8; i < 16; i++) size = (size << 8) | header[i];
+                        }
+                        else if (size == 0)
+                        {
+                            size = length - offset;
+                        }
+                        if (size < 8) { boxes.Add("(bad size)"); break; }
+                        if (offset + size > length) { boxes.Add("(truncated)"); break; }
+                        offset += size;
+                    }
+                    return string.Join(" ", boxes.ToArray());
+                }
+            }
+            catch (Exception e)
+            {
+                return "error: " + e.Message;
+            }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $uiFixHelpers -Language CSharp
+
+    $WM_CLOSE = [uint32]0x0010
+    $WM_QUERYENDSESSION = [uint32]0x0011
+    $WM_ENDSESSION = [uint32]0x0016
+    $ENDSESSION_LOGOFF = [int64]2147483648   # 0x80000000
+    $RecorderThread = 'TedCat recorder'
+
+    # A fresh TedCat with the known settings; returns its TedCat.Main window.
+    function Start-UiFixTedCat([string]$Why) {
+        Get-Process -Name TedCat -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+        Write-Settings
+        $mark = Get-LogMark
+        $script:Ted = Start-TedCat
+        Assert ($null -ne (Wait-Log 'input hook status: Active' $mark 15000)) "TedCat did not start ($Why)"
+        $main = [TedCatSmoke.Win]::Find('TedCat.Main')
+        Assert ($main -ne [IntPtr]::Zero) 'no TedCat.Main window'
+        return $main
+    }
+
+    # Shift + hold + drag on the canvas until the recording pill shows; returns the output path.
+    function Start-UiFixRecording {
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $x1 = $canvas[0] + 30; $y1 = $canvas[1] + 30
+        $mark = Get-LogMark
+        Invoke-Input ([TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $false)) 'Shift down'
+        try {
+            Start-Sleep -Milliseconds 80
+            Invoke-HoldDrag $x1 $y1 ($x1 + 400) ($y1 + 300) 600
+            Start-Sleep -Milliseconds 80
+        } finally {
+            [void][TedCatSmoke.Input]::Key($VK_SHIFT, $SC_SHIFT, $true)
+        }
+        $line = Wait-Log 'starting recording .* to .+\.mp4\s*$|recording could not start: .*|too small to record' $mark 20000
+        Assert ($null -ne $line) 'TedCat did not start a recording within 20 s'
+        Assert ($line -match ' to (.+\.mp4)\s*$') "TedCat did not start recording: $line"
+        $path = $Matches[1]
+        Assert (Wait-Until { $null -ne [TedCatSmoke.Win]::FindVisible('TedCat.Hud') } 10000) 'no recording pill (TedCat.Hud) appeared'
+        return $path
+    }
+
+    # Suspends TedCat's recorder thread so a save cannot finish until Resume.
+    function Suspend-UiFixRecorder {
+        $thread = [TedCatSmokeUiFix.Session]::SuspendNamed($script:Ted.Id, $RecorderThread)
+        if ($thread -eq [IntPtr]::Zero) {
+            Skip "could not find and suspend TedCat's '$RecorderThread' thread (threads: $([TedCatSmokeUiFix.Session]::ThreadNames($script:Ted.Id)))"
+        }
+        Note "suspended TedCat's '$RecorderThread' thread: the save cannot finish until it is resumed"
+        return $thread
+    }
+
+    # The MP4 must be finalized (moov box present, nothing truncated).
+    function Assert-UiFixMp4Complete([string]$Path, [string]$When) {
+        Assert (Test-Path -LiteralPath $Path) "the recording $Path does not exist"
+        $boxes = [TedCatSmokeUiFix.Session]::Mp4Boxes($Path)
+        Note ("{0}: {1} bytes, boxes [{2}]" -f (Split-Path -Leaf $Path), (Get-Item -LiteralPath $Path).Length, $boxes)
+        Assert ($boxes -match '\bmoov\b' -and $boxes -notmatch 'truncated|bad size|error') "the recording was not finalized $When (boxes: $boxes)"
+        $ffprobe = Find-FFprobe
+        if ($ffprobe) {
+            $duration = (Invoke-Native $ffprobe @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Path)).Trim()
+            Note "ffprobe duration: $duration s"
+            Assert ($duration -match '^\d+(\.\d+)?$' -and [double]$duration -gt 0) "ffprobe cannot read the recording: $duration"
+        }
+        Copy-Item -LiteralPath $Path -Destination $ArtifactsDir -ErrorAction SilentlyContinue
+    }
+
+    # Press on the knob, run $DuringHold while the button is down, wait past the
+    # hold time, drag the knob by $Dx, release. Returns "tagged sequence|moved".
+    function Invoke-UiFixKnobHold([int]$Dx, [scriptblock]$DuringHold = $null) {
+        [TedCatSmoke.Ui]::ResetKnob()
+        Start-Sleep -Milliseconds 200
+        [TedCatSmoke.Ui]::ClearEvents()
+        $before = [TedCatSmoke.Ui]::Rect('Knob')
+        $a = Center $before
+        Invoke-Input ([TedCatSmoke.Input]::Move($a[0], $a[1])) 'the move to the knob'
+        Start-Sleep -Milliseconds 60
+        Invoke-Input ([TedCatSmoke.Input]::Down($a[0], $a[1])) 'the press on the knob'
+        try {
+            if ($DuringHold) { & $DuringHold | Out-Host }
+            Start-Sleep -Milliseconds 700   # well past the 350 ms hold
+            Invoke-Input ([TedCatSmoke.Input]::MovePath($a[0], $a[1], $a[0] + $Dx, $a[1], 15, 15)) 'the drag'
+            Start-Sleep -Milliseconds 150
+        } finally {
+            if (-not [TedCatSmoke.Input]::Up($a[0] + $Dx, $a[1])) { Write-Host "    (release failed: $([TedCatSmoke.Input]::LastError))" }
+        }
+        Start-Sleep -Milliseconds 400
+        $after = [TedCatSmoke.Ui]::Rect('Knob')
+        return ('{0}|{1}' -f (Get-TaggedSequence 'Knob'), ($after[0] - $before[0]))
+    }
+
+    Invoke-Step 'foreign-app-messages' {
+        $main = Start-UiFixTedCat 'foreign-app-messages'
+        $msg = [TedCatSmokeUiFix.Session]::MessageWindow('TedCat.Msg')
+        $topLevel = @([TedCatSmoke.Win]::Windows('TedCat.Msg'))
+        Note ("TedCat.Main {0}; message-only TedCat.Msg {1}; TedCat.Msg among top-level windows: {2}" -f $main, $msg, $topLevel.Count)
+        Assert ($msg -ne [IntPtr]::Zero) 'no message-only TedCat.Msg window'
+        Assert ($topLevel.Count -eq 0) 'TedCat.Msg is a top-level window, so other processes broadcasts reach it'
+        $mark = Get-LogMark
+        $posted = 0
+        foreach ($n in 1..3) {
+            foreach ($target in @($main, $msg)) {
+                foreach ($junk in @(@(0, 0x41414141), @(0x1234, 0x7FFF00001000), @(1, 8))) {
+                    $err = [TedCatSmokeUiFix.Session]::Post($target, [uint32](0x8000 + $n), [uint64]$junk[0], [int64]$junk[1])
+                    Assert ($null -eq $err) "posting WM_APP+$n failed: $err"
+                    $posted++
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 800
+        Assert-TedRunning
+        $onMain = Wait-Log 'ignored WM_APP\+\d on the main window.*' $mark 2000
+        $onMsg = Wait-Log 'ignored WM_APP\+\d on the message window.*' $mark 2000
+        Note "posted $posted WM_APP+1..3 messages with junk WPARAM/LPARAM; TedCat is still running"
+        Note "log: $(if ($onMain) { $onMain } else { '(nothing about the main window)' })"
+        Note "log: $(if ($onMsg) { $onMsg } else { '(nothing about the message window)' })"
+        Assert ($null -ne $onMain) 'TedCat did not report ignoring the junk posted to TedCat.Main'
+        Assert ($null -ne $onMsg) 'TedCat did not report ignoring the junk posted to TedCat.Msg'
+
+        # TedCat's own posts (with the cookie) still get through: a screenshot
+        # needs the hook's WM_APP_GESTURE messages and the UI thread.
+        Assert ([TedCatSmoke.Clip]::Clear()) 'could not clear the clipboard'
+        $canvas = [TedCatSmoke.Ui]::Rect('Canvas')
+        $x1 = $canvas[0] + 40; $y1 = $canvas[1] + 40
+        $mark = Get-LogMark
+        Invoke-HoldDrag $x1 $y1 ($x1 + 200) ($y1 + 120) 600
+        $hasImage = Wait-Until { Clipboard-HasImage } 5000
+        $shot = Wait-Log 'screenshot \d+x\d+ copied' $mark 2000
+        Note "screenshot after the junk: $(if ($shot) { $shot } else { '(none)' }); clipboard image: $hasImage"
+        Assert ($hasImage -and $null -ne $shot) 'the hold-and-drag screenshot no longer works after the junk messages'
+        Assert-TedRunning
+        Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+        [void]$script:Ted.WaitForExit(10000)
+    }
+
+    Invoke-Step 'quit-while-saving' {
+        $main = Start-UiFixTedCat 'quit-while-saving'
+        $path = Start-UiFixRecording
+        Note "recording to $path"
+        Start-Sleep -Milliseconds 1000
+        $recorder = Suspend-UiFixRecorder
+        $mark = Get-LogMark
+        $dx = 150
+        try {
+            # 1. Pressed just before Quit: still undecided when the gesture is
+            #    switched off, so it must come back as TedCat's replay.
+            $script:closeError = 'not sent'
+            $pending = Invoke-UiFixKnobHold $dx { $script:closeError = [TedCatSmokeUiFix.Session]::Post($main, $WM_CLOSE, 0, 0) }
+            Assert ($null -eq $script:closeError) "posting WM_CLOSE failed: $($script:closeError)"
+            $quitting = Wait-Log 'finalizing the recording before quitting' $mark 5000
+            $off = Wait-Log 'TedCat is quitting; presses are no longer held' $mark 100
+            # 2. Pressed during the save: never held, passes straight through.
+            $during = Invoke-UiFixKnobHold $dx
+            $alive = -not $script:Ted.HasExited
+        } finally {
+            [void][TedCatSmokeUiFix.Session]::Resume($recorder)
+        }
+        Note "log: $(if ($off) { $off } else { '(no gesture-off line)' })"
+        Note "log: $(if ($quitting) { $quitting } else { '(no finalizing line)' })"
+        Note "press pending when Quit started: knob got '$(($pending -split '\|')[0])', moved $(($pending -split '\|')[1]) px (expected $dx)"
+        Note "press-and-hold drag during the save: knob got '$(($during -split '\|')[0])', moved $(($during -split '\|')[1]) px (expected $dx)"
+        Note "TedCat still running (saving) during both presses: $alive"
+        Assert ($null -ne $quitting) 'TedCat did not start finalizing the recording on Quit'
+        Assert $alive 'TedCat exited before the save was released, so the presses did not happen during the save'
+        Assert (($pending -split '\|')[0] -eq 'DOWN:TCAT UP:0x0') "the press pending at Quit was not handed back (expected 'DOWN:TCAT UP:0x0', got '$(($pending -split '\|')[0])')"
+        Assert (($during -split '\|')[0] -eq 'DOWN:0x0 UP:0x0') "a press-and-hold drag during the save was held or swallowed (expected 'DOWN:0x0 UP:0x0', got '$(($during -split '\|')[0])')"
+        foreach ($result in @($pending, $during)) {
+            Assert ([Math]::Abs([int](($result -split '\|')[1]) - $dx) -le 3) "the knob did not follow the drag ($result)"
+        }
+
+        $exited = $script:Ted.WaitForExit(30000)
+        $saved = Wait-Log 'saved .* before quitting|recording failed while quitting.*|did not finish in time' $mark 2000
+        Note ("after the save was released: TedCat exited {0} (code {1}); log: {2}" -f $exited, $(if ($exited) { $script:Ted.ExitCode } else { '-' }), $(if ($saved) { $saved } else { '(none)' }))
+        Assert $exited 'TedCat did not exit within 30 s after the save was released'
+        Assert ($script:Ted.ExitCode -eq 0) ('TedCat exited with code 0x{0:X8}' -f $script:Ted.ExitCode)
+        Assert ($saved -match 'saved .* before quitting') "the recording was not saved on Quit: $saved"
+        Assert-UiFixMp4Complete $path 'on Quit'
+    }
+
+    Invoke-Step 'session-end-saves-recording' {
+        $main = Start-UiFixTedCat 'session-end-saves-recording'
+        $path = Start-UiFixRecording
+        Note "recording to $path"
+        Start-Sleep -Seconds 2
+        $mark = Get-LogMark
+        $query = [TedCatSmokeUiFix.Session]::Send($main, $WM_QUERYENDSESSION, 0, $ENDSESSION_LOGOFF, 10000)
+        $stopping = Wait-Log 'stopping the recording' $mark 3000
+        $blocked = Wait-Log 'shutdown block reason set.*|could not set a shutdown block reason.*' $mark 1000
+        Note "WM_QUERYENDSESSION: $query"
+        Note "log: $(if ($stopping) { $stopping } else { '(the recording was not stopped)' })"
+        Note "log: $(if ($blocked) { $blocked } else { '(no shutdown block reason line)' }); reason read from here: $([TedCatSmokeUiFix.Session]::BlockReason($main))"
+        Assert ($query.Ok -and $query.Result -eq 1) "TedCat did not answer WM_QUERYENDSESSION with TRUE ($query)"
+        Assert ($null -ne $stopping) 'WM_QUERYENDSESSION did not start finalizing the recording'
+        Assert ($blocked -match 'shutdown block reason set') "no shutdown block reason while the recording is saved: $blocked"
+
+        $end = [TedCatSmokeUiFix.Session]::Send($main, $WM_ENDSESSION, 1, $ENDSESSION_LOGOFF, 40000)
+        # Windows may end the process as soon as WM_ENDSESSION returns: do exactly that.
+        Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+        [void]$script:Ted.WaitForExit(10000)
+        $saved = Wait-Log 'recording saved: .*|saved .* bytes.*' $mark 500
+        Note "WM_ENDSESSION: $end; TedCat then ended at once, as Windows would"
+        Note "log: $(if ($saved) { $saved } else { '(no saved line)' })"
+        Assert $end.Ok "WM_ENDSESSION did not return within 40 s ($end)"
+        Assert-UiFixMp4Complete $path 'when WM_ENDSESSION returned'
+    }
+
+    Invoke-Step 'session-end-during-quit' {
+        $main = Start-UiFixTedCat 'session-end-during-quit'
+        $path = Start-UiFixRecording
+        Note "recording to $path"
+        Start-Sleep -Milliseconds 1000
+        $recorder = Suspend-UiFixRecorder
+        $mark = Get-LogMark
+        $end = $null
+        try {
+            $closeError = [TedCatSmokeUiFix.Session]::Post($main, $WM_CLOSE, 0, 0)
+            Assert ($null -eq $closeError) "posting WM_CLOSE failed: $closeError"
+            $quitting = Wait-Log 'finalizing the recording before quitting' $mark 5000
+            Assert ($null -ne $quitting) 'TedCat did not start finalizing the recording on Quit'
+            $query = [TedCatSmokeUiFix.Session]::Send($main, $WM_QUERYENDSESSION, 0, $ENDSESSION_LOGOFF, 10000)
+            $blocked = Wait-Log 'shutdown block reason set.*|could not set a shutdown block reason.*' $mark 1000
+            Note "quit in progress; WM_QUERYENDSESSION: $query"
+            Note "log: $(if ($blocked) { $blocked } else { '(no shutdown block reason line)' }); reason read from here: $([TedCatSmokeUiFix.Session]::BlockReason($main))"
+            Assert ($query.Ok -and $query.Result -eq 1) "TedCat did not answer WM_QUERYENDSESSION with TRUE ($query)"
+            Assert ($blocked -match 'shutdown block reason set') "no shutdown block reason while the quit saves: $blocked"
+            $end = [TedCatSmokeUiFix.Session]::SendAsync($main, $WM_ENDSESSION, 1, $ENDSESSION_LOGOFF, 40000)
+            Start-Sleep -Milliseconds 1500
+            $early = $end.Done
+            Note "WM_ENDSESSION while the save is blocked: $end"
+            Assert (-not $early) "WM_ENDSESSION returned ($end) while the quit was still saving the recording"
+        } finally {
+            [void][TedCatSmokeUiFix.Session]::Resume($recorder)
+        }
+        Assert ($end.Wait(35000)) 'WM_ENDSESSION did not return within 35 s after the save was released'
+        # Windows may end the process as soon as WM_ENDSESSION returns: do exactly that.
+        Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+        [void]$script:Ted.WaitForExit(10000)
+        $saved = Wait-Log 'saved .* before quitting|recording saved: .*' $mark 500
+        Note "after the save was released, WM_ENDSESSION: $end; TedCat then ended at once, as Windows would"
+        Note "log: $(if ($saved) { $saved } else { '(no saved line)' })"
+        Assert $end.Ok "WM_ENDSESSION failed ($end)"
+        Assert-UiFixMp4Complete $path 'when WM_ENDSESSION returned during the quit'
+    }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
     $script:Results.Add([pscustomobject]@{ Step = 'script'; Result = 'failed'; Evidence = $_.Exception.Message })

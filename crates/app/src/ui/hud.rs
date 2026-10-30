@@ -64,7 +64,8 @@ pub(crate) enum HudMode {
 
 struct HudState {
     hwnd: HWND,
-    main: HWND,
+    /// Receives this window's `WM_APP_UI` actions (TedCat's message-only window).
+    notify: HWND,
     generation: u32,
     audio_only: bool,
     mode: HudMode,
@@ -92,9 +93,9 @@ fn size(scale: f64) -> (i32, i32) {
 }
 
 impl Hud {
-    /// Shows the pill in `placement`'s corner.
+    /// Shows the pill in `placement`'s corner; its clicks go to `notify` as `WM_APP_UI`.
     pub(crate) fn show(
-        main: HWND,
+        notify: HWND,
         generation: u32,
         audio_only: bool,
         placement: Placement,
@@ -111,7 +112,7 @@ impl Hud {
         )?;
         let state = Rc::new(RefCell::new(HudState {
             hwnd,
-            main,
+            notify,
             generation,
             audio_only,
             mode: HudMode::Saving,
@@ -285,7 +286,7 @@ fn handle(st: &mut HudState, message: u32, wparam: WPARAM) -> Option<LRESULT> {
             unsafe {
                 let _ = KillTimer(Some(hwnd), EXPIRE_TIMER);
             }
-            post_action(st.main, UiAction::HudExpired, st.generation);
+            post_action(st.notify, UiAction::HudExpired, st.generation);
         }
         WM_MOUSEMOVE => {
             if !st.tracking {
@@ -315,7 +316,7 @@ fn handle(st: &mut HudState, message: u32, wparam: WPARAM) -> Option<LRESULT> {
                 let _ = ReleaseCapture();
             }
             if was_pressed && window::cursor_inside(hwnd) {
-                post_action(st.main, UiAction::HudClicked, st.generation);
+                post_action(st.notify, UiAction::HudClicked, st.generation);
             }
         }
         WM_CAPTURECHANGED => st.pressed = false,

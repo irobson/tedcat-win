@@ -95,7 +95,8 @@ impl Fonts {
 
 struct CardState {
     hwnd: HWND,
-    main: HWND,
+    /// Receives this window's `WM_APP_UI` actions (TedCat's message-only window).
+    notify: HWND,
     generation: u32,
     info: CardInfo,
     placement: Placement,
@@ -139,9 +140,9 @@ fn stop_countdown(hwnd: HWND) {
 }
 
 impl SavedCard {
-    /// Shows the card in `placement`'s corner.
+    /// Shows the card in `placement`'s corner; its actions go to `notify` as `WM_APP_UI`.
     pub(crate) fn show(
-        main: HWND,
+        notify: HWND,
         generation: u32,
         info: CardInfo,
         placement: Placement,
@@ -158,7 +159,7 @@ impl SavedCard {
         let path = info.path.clone();
         let state = Rc::new(RefCell::new(CardState {
             hwnd,
-            main,
+            notify,
             generation,
             info,
             placement,
@@ -391,7 +392,7 @@ fn handle(state: &Rc<RefCell<CardState>>, message: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == COUNTDOWN_TIMER => {
             stop_countdown(hwnd);
             if !st.dragging {
-                post_action(st.main, UiAction::CardExpired, st.generation);
+                post_action(st.notify, UiAction::CardExpired, st.generation);
             }
         }
         WM_MOUSEMOVE => {
@@ -436,7 +437,7 @@ fn handle(state: &Rc<RefCell<CardState>>, message: u32, wparam: WPARAM, lparam: 
             let pressed = st.pressed.take();
             let release_hit = hit_test(&st, x, y);
             let inside = window::cursor_inside(hwnd);
-            let (main, generation) = (st.main, st.generation);
+            let (notify, generation) = (st.notify, st.generation);
             drop(st);
             // SAFETY: releases our own capture (WM_CAPTURECHANGED re-enters harmlessly).
             unsafe {
@@ -451,7 +452,7 @@ fn handle(state: &Rc<RefCell<CardState>>, message: u32, wparam: WPARAM, lparam: 
                         Hit::Link => UiAction::CardReveal,
                         Hit::Thumbnail | Hit::Body => UiAction::CardOpen,
                     };
-                    post_action(main, action, generation);
+                    post_action(notify, action, generation);
                 }
             }
             refresh_pointer(state);
