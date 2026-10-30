@@ -201,6 +201,7 @@ dependencies = [
  "tedcat-core",
  "windows",
  "windows-core",
+ "windows-future",
 ]
 
 [[package]]
