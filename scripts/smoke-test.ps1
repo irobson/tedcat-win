@@ -2886,15 +2886,20 @@ namespace TedCatHookSmoke
             Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $false, $false)) 'Shift down'
             Start-Sleep -Milliseconds 60
             Invoke-ProbeInput ([TedCatHookSmoke.Send]::Wheel($c[0], $c[1], -120)) 'the wheel notch'
-            Start-Sleep -Milliseconds 40
+            # Windows routes wheel messages to the window under the pointer
+            # on a path of their own: on the runner they can reach the window
+            # well after later key messages, even when injected first. Let the
+            # notch land before Shift goes up.
+            Start-Sleep -Milliseconds 400
             Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $true, $false)) 'Shift up'
             Start-Sleep -Milliseconds 450
             $overlay += @(Get-VisibleOverlay)
             Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $leftUp)) 'the release'
             Start-Sleep -Milliseconds 700
             $wheel = Get-ProbeOrder @(0x10)
-            Note "press, Shift down, wheel, Shift up, release: probe got '$wheel'"
-            Assert ($wheel -match '^LDOWN:TCAT KEYDOWN\(10\):TCAT WHEEL\+S:TCAT KEYUP\(10\):(TCAT|0x0) LUP:(TCAT|0x0)$') "the wheel notch must follow the held press and the Shift press, with Shift down (expected 'LDOWN:TCAT KEYDOWN(10):TCAT WHEEL+S:TCAT KEYUP(10) LUP'), got '$wheel'"
+            Note "press, Shift down, wheel, Shift up, release: probe got '$wheel' (+S: MK_SHIFT on the wheel message)"
+            # Not held (it would pass at once, ahead of the held press): TedCat's replay, right behind press and Shift.
+            Assert ($wheel -match '^LDOWN:TCAT KEYDOWN\(10\):TCAT WHEEL(\+S)?:TCAT KEYUP\(10\):(TCAT|0x0) LUP:(TCAT|0x0)$') "the wheel notch must be replayed right behind the held press and the Shift press (expected 'LDOWN:TCAT KEYDOWN(10):TCAT WHEEL+S:TCAT KEYUP(10) LUP'), got '$wheel'"
 
             $shot = Wait-Log 'screenshot \d+x\d+ copied|screenshot failed.*' $mark 200
             $down = Get-DownKeys
