@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tedcat_core::{Codec, VideoEncodingPlan};
 
 use super::audio::{AudioCapture, OpenError};
-use super::sys::{delete_output, now_hns, MtaScope};
+use super::sys::{delete_output, media_foundation_available, now_hns, MtaScope};
 use super::timing;
 use super::video::{VideoCapture, VideoOutcome};
 use super::writer::{copy_buffer, VideoFormat, Writer, AUDIO_RATE};
@@ -21,6 +21,11 @@ use crate::{log_error, log_info, log_warn};
 
 /// How long an audio-only start waits for the first packet before going on anyway.
 const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Caps the encoded video size (`WIDTHxHEIGHT`, in pixels) below the codec's
+/// own limit. Only the smoke test sets it, to exercise the downscaling path
+/// on a display too small to need it.
+const TEST_MAX_VIDEO_SIZE: &str = "TEDCAT_TEST_MAX_VIDEO_SIZE";
 
 /// Commands from the `Recorder` handle.
 pub(super) enum Command {
@@ -100,6 +105,12 @@ pub(super) fn run(
     ready: SyncSender<Result<(), String>>,
     commands: Receiver<Command>,
 ) -> Result<RecordingResult, String> {
+    // Before anything calls into the delay-loaded Media Foundation DLLs, and
+    // reported as is: the message already says what to do.
+    if let Err(e) = media_foundation_available() {
+        let _ = ready.send(Err(e.clone()));
+        return Err(e);
+    }
     let scope = match MtaScope::enter(true) {
         Ok(scope) => scope,
         Err(e) => {
@@ -163,12 +174,12 @@ impl Recording {
             Target::Region { rect, monitor } => {
                 let plan = VideoEncodingPlan::new(rect.to_logical(monitor.scale).size(), monitor.scale, Codec::H264)
                     .ok_or_else(|| String::from("The selected area is too small to record."))?;
+                let plan = apply_test_size_limit(plan);
                 log_info!(
-                    "starting region recording {rect:?} on monitor {:?} (scale {}): {}x{} at {} bps -> {}",
+                    "starting region recording {rect:?} on monitor {:?} (scale {}): {} at {} bps -> {}",
                     monitor.rect,
                     monitor.scale,
-                    plan.pixel_width,
-                    plan.pixel_height,
+                    describe_size(&plan),
                     plan.average_bitrate,
                     path.display()
                 );
@@ -183,13 +194,7 @@ impl Recording {
                 } else {
                     None
                 };
-                let format = VideoFormat {
-                    width: plan.pixel_width,
-                    height: plan.pixel_height,
-                    bitrate: plan.average_bitrate,
-                    fps: VideoEncodingPlan::FRAMES_PER_SECOND,
-                };
-                let writer = Writer::create(&path, Some(format), audio.is_some()).map_err(|e| {
+                let (writer, plan) = create_video_writer(&path, plan, audio.is_some()).map_err(|e| {
                     drop(audio.take());
                     delete_output(&path);
                     format!("Could not create the video file: {e}")
@@ -295,6 +300,72 @@ impl Recording {
     }
 }
 
+/// The sink writer's video stream for `plan`.
+fn video_format(plan: &VideoEncodingPlan) -> VideoFormat {
+    VideoFormat {
+        width: plan.pixel_width,
+        height: plan.pixel_height,
+        bitrate: plan.average_bitrate,
+        fps: VideoEncodingPlan::FRAMES_PER_SECOND,
+    }
+}
+
+/// Creates the sink writer for `plan`. When no encoder configuration accepts
+/// it and the plan has a landscape fallback (a tall portrait picture, which
+/// some encoders measure against the landscape limit), tries again with that.
+/// Returns the plan the writer was created for.
+fn create_video_writer(path: &Path, plan: VideoEncodingPlan, audio: bool) -> Result<(Writer, VideoEncodingPlan), String> {
+    let error = match Writer::create(path, Some(video_format(&plan)), audio) {
+        Ok(writer) => return Ok((writer, plan)),
+        Err(error) => error,
+    };
+    let Some(fallback) = plan.landscape_fallback() else { return Err(error) };
+    log_warn!(
+        "no encoder accepted {}x{} ({error}); trying {}x{}",
+        plan.pixel_width,
+        plan.pixel_height,
+        fallback.pixel_width,
+        fallback.pixel_height
+    );
+    let writer = Writer::create(path, Some(video_format(&fallback)), audio)?;
+    Ok((writer, fallback))
+}
+
+/// "480x320", or "5120x1440 encoded as 4096x1152" when the plan scales down.
+fn describe_size(plan: &VideoEncodingPlan) -> String {
+    if plan.is_scaled() {
+        format!(
+            "{}x{} encoded as {}x{}",
+            plan.source_width, plan.source_height, plan.pixel_width, plan.pixel_height
+        )
+    } else {
+        format!("{}x{}", plan.pixel_width, plan.pixel_height)
+    }
+}
+
+/// `plan`, further limited by `TEST_MAX_VIDEO_SIZE` when that is set.
+fn apply_test_size_limit(plan: VideoEncodingPlan) -> VideoEncodingPlan {
+    let Some(value) = std::env::var_os(TEST_MAX_VIDEO_SIZE) else { return plan };
+    match value.to_str().and_then(parse_size) {
+        Some((width, height)) => {
+            log_warn!("{TEST_MAX_VIDEO_SIZE} is set: encoding at most {width}x{height}");
+            plan.fit_within(width, height)
+        }
+        None => {
+            log_warn!("ignoring {TEST_MAX_VIDEO_SIZE}={value:?}: expected WIDTHxHEIGHT");
+            plan
+        }
+    }
+}
+
+/// Parses `WIDTHxHEIGHT` (positive integers, `x` or `X`, spaces allowed).
+fn parse_size(text: &str) -> Option<(u32, u32)> {
+    let (width, height) = text.split_once(['x', 'X'])?;
+    let width: u32 = width.trim().parse().ok()?;
+    let height: u32 = height.trim().parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// Writes the held-back last frame up to the stop time, repeating it at the
 /// stop time if it is old (capture only delivers frames when pixels change).
 fn write_video_tail(writer: &mut Writer, outcome: VideoOutcome, stop_time: i64) {
@@ -318,4 +389,26 @@ fn write_video_tail(writer: &mut Writer, outcome: VideoOutcome, stop_time: i64) 
 
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_size_limits_are_parsed() {
+        assert_eq!(parse_size("240x240"), Some((240, 240)));
+        assert_eq!(parse_size(" 1280 X 720 "), Some((1280, 720)));
+        for bad in ["", "240", "x240", "240x", "0x240", "240x0", "-1x240", "240x240x2", "ax b"] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn scaled_plans_say_both_sizes() {
+        let plan = VideoEncodingPlan::new(tedcat_core::Size::new(5120.0, 1440.0), 1.0, Codec::H264).unwrap();
+        assert_eq!(describe_size(&plan), "5120x1440 encoded as 4096x1152");
+        let plan = VideoEncodingPlan::new(tedcat_core::Size::new(480.0, 320.0), 1.0, Codec::H264).unwrap();
+        assert_eq!(describe_size(&plan), "480x320");
+    }
 }

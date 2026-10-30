@@ -9,7 +9,15 @@
 //! throttled to 30 fps, encoded by a Media Foundation sink writer to MP4:
 //! H.264 at the size and bitrate from `tedcat_core::VideoEncodingPlan`
 //! (`Codec::H264`, scale = monitor.scale), hardware transforms enabled.
+//! A region larger than H.264 accepts (4096 x 2304) is scaled down to the
+//! plan's encoded size, on the GPU (D3D11 video processor) or on the CPU.
 //! TedCat's own windows are excluded from capture by display affinity.
+//! If the monitor's size changes mid-recording (resolution, rotation), the
+//! recording is interrupted and keeps what was captured before.
+//!
+//! Media Foundation (mfplat.dll, mfreadwrite.dll) is delay-loaded, because
+//! Windows N/KN lacks it without the Media Feature Pack: TedCat still starts
+//! there and recording fails with a message saying so.
 //!
 //! System audio: WASAPI loopback on the default render endpoint (shared mode,
 //! event driven), converted to 16-bit PCM and encoded as AAC 48 kHz stereo
