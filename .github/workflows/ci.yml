@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']
   pull_request:
   workflow_dispatch:
 
@@ -43,3 +43,52 @@ jobs:
           path: target/release/TedCat.exe
           retention-days: 30
           if-no-files-found: error
+
+  smoke:
+    name: Smoke test (TedCat.exe on the runner desktop)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download TedCat.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: TedCat-${{ github.sha }}
+          path: dist
+
+      - name: Install ffprobe (best effort)
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: powershell
+        run: |
+          if (Get-Command ffprobe -ErrorAction SilentlyContinue) { "ffprobe already installed"; exit 0 }
+          choco install ffmpeg -y --no-progress --limit-output
+          Get-Command ffprobe -ErrorAction SilentlyContinue | Format-List Source
+
+      # The runner has no graphicsCaptureWithoutBorder consent entry, which
+      # Windows treats as denied: every capture then gets the yellow border
+      # whatever the app asks. Allow it for desktop apps on this throwaway VM
+      # so the smoke test checks that TedCat turns the border off.
+      - name: Allow borderless screen capture for desktop apps
+        shell: powershell
+        run: |
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\graphicsCaptureWithoutBorder'
+          New-Item -Path "$key\NonPackaged" -Force | Out-Null
+          Set-ItemProperty -Path $key -Name Value -Value Allow
+          Set-ItemProperty -Path "$key\NonPackaged" -Name Value -Value Allow
+
+      - name: Smoke test
+        shell: powershell
+        run: .\scripts\smoke-test.ps1 -Exe dist\TedCat.exe -ArtifactsDir smoke-artifacts
+
+      - name: Upload smoke artifacts (log, recordings, desktop screenshots)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ github.sha }}
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
