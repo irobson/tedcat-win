@@ -19,6 +19,20 @@
 //!   virtual-desk coordinates, `dwExtraInfo = TEDCAT_INPUT_MARKER`), from the
 //!   hook thread but outside the hook callback (post a thread message to
 //!   yourself), preserving order.
+//! - Buttons: the hook reports logical buttons ("left" is the primary button,
+//!   after the swap of "primary button = right"); `SendInput` takes physical
+//!   ones and swaps them itself. Replays convert back with `SM_SWAPBUTTON`,
+//!   read for every batch since the setting can change at any time.
+//! - Modifier keys (Shift, Ctrl, Alt, Win) pressed or released while a press
+//!   is held, or while replays are queued, are swallowed and replayed in the
+//!   same ordered `SendInput` call, so a Ctrl+click stays a Ctrl+click. Only
+//!   when the foreground window's process can take injected keys (ours, or
+//!   not more privileged); otherwise they pass as before, so UIPI can never
+//!   drop a replayed key-up and leave a modifier stuck.
+//! - When a press with modifiers is (or may be) swallowed for good, the
+//!   unassigned key 0xE8 is injected while the modifier is down, so the app
+//!   does not see a lone Alt, Win, Shift or Ctrl tap (menu bar, KeyTips,
+//!   Start menu, IME mode).
 //! - Ignore events whose `dwExtraInfo == TEDCAT_INPUT_MARKER` (our own replays).
 //!   Injected events from other processes are treated like real input, so
 //!   automation (and the CI smoke test) can drive the gesture.
@@ -79,25 +93,28 @@ use windows::Win32::System::Threading::{
     SetThreadPriority, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_HIGHEST,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_MOUSE, LASTINPUTINFO, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN,
-    VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, GetLastInputInfo, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, LASTINPUTINFO, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetSystemMetrics,
     GetWindowThreadProcessId, KillTimer, PeekMessageW, PostThreadMessageW, SetTimer, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    USER_TIMER_MINIMUM, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, USER_TIMER_MINIMUM, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use self::logic::{
-    class_has_prefix, hooks_look_dead, is_pen_or_touch, may_hold_over, modifiers_from_keys, normalize_absolute,
-    Command, HookLogic, IntegrityCache, LogLevel, PressContext, ReplayAction, ReplayEvent, Throttled, UpdateThrottle,
+    class_has_prefix, hooks_look_dead, is_modifier_vk, is_pen_or_touch, may_hold_over, may_queue_keys_for,
+    modifiers_from_keys, normalize_absolute, Command, HookLogic, IntegrityCache, KeyStroke, LogLevel, PressContext,
+    Replay, ReplayAction, ReplayEvent, Throttled, UpdateThrottle,
 };
 use crate::geom::{MonitorInfo, PointPx};
 use crate::messages::{
@@ -409,6 +426,9 @@ impl HookThread {
         }
         self.logic.shutdown();
         self.run_commands();
+        // Keys swallowed while a press was held still go out, so no modifier
+        // is left down by an exit in the middle of a click.
+        self.send_replays();
         self.log.write(LogLevel::Info, "Input hooks removed.".to_owned());
     }
 
@@ -491,18 +511,33 @@ impl HookThread {
         swallow
     }
 
-    /// A keyboard hook event. Only Escape matters. Returns true to swallow it.
+    /// A keyboard hook event: Escape (cancel, emergency switch) and the
+    /// modifier keys (kept in order with a held press). Returns true to swallow it.
     fn key_event(&mut self, message: u32, info: &KBDLLHOOKSTRUCT) -> bool {
-        if info.vkCode != u32::from(VK_ESCAPE.0) || info.dwExtraInfo == TEDCAT_INPUT_MARKER {
+        let escape = info.vkCode == u32::from(VK_ESCAPE.0);
+        if info.dwExtraInfo == TEDCAT_INPUT_MARKER || !(escape || is_modifier_vk(info.vkCode)) {
             return false;
         }
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if !down && !matches!(message, WM_KEYUP | WM_SYSKEYUP) {
             return false;
         }
-        // SAFETY: GetTickCount has no preconditions.
-        let now = unsafe { GetTickCount() };
-        let swallow = self.logic.escape(down, now);
+        let swallow = if escape {
+            // SAFETY: GetTickCount has no preconditions.
+            let now = unsafe { GetTickCount() };
+            self.logic.escape(down, now)
+        } else {
+            let key = KeyStroke {
+                // Virtual keys and scan codes fit in 16 bits.
+                vk: info.vkCode as u16,
+                scan: info.scanCode as u16,
+                extended: info.flags.0 & LLKHF_EXTENDED.0 != 0,
+                up: !down,
+            };
+            let probe = &mut self.probe;
+            let now_ms = self.clock.elapsed().as_millis() as u64;
+            self.logic.modifier_key(key, || probe.foreground_accepts_keys(now_ms))
+        };
         self.run_commands();
         swallow
     }
@@ -699,25 +734,53 @@ impl HookThread {
         }
     }
 
-    /// Injects the queued replays with one `SendInput` call; fails open if
-    /// Windows inserts fewer events than requested.
+    /// Injects the queued replays, mouse and keyboard, with one `SendInput`
+    /// call, so they keep their order.
+    ///
+    /// If Windows inserts fewer events than requested, the key releases that
+    /// did not get in are tried once more on their own (a lost key-up leaves a
+    /// modifier stuck down), and if a mouse event did not get in the hook
+    /// fails open. Keys alone (a mask key, modifiers released after a click)
+    /// failing is only logged: click holding does not depend on them.
     fn send_replays(&mut self) {
-        let events = self.logic.take_replays();
-        if events.is_empty() {
+        let replays = self.logic.take_replays();
+        if replays.is_empty() {
             return;
         }
+        // The swap can change at any time; read it for every batch.
+        // SAFETY: GetSystemMetrics has no preconditions.
+        let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
         let screen = VirtualScreen::current();
-        let inputs: Vec<INPUT> = events.iter().map(|event| mouse_input(event, &screen)).collect();
+        let inputs: Vec<INPUT> = replays.iter().map(|replay| replay_input(replay, &screen, swapped)).collect();
         // SAFETY: `inputs` is a valid slice of INPUT structures of the given size.
-        let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if inserted as usize != inputs.len() {
-            // SAFETY: GetLastError has no preconditions.
-            let error = unsafe { GetLastError() };
-            self.logic.replay_failed(format!(
-                "SendInput inserted {inserted} of {} events, error {}",
-                inputs.len(),
-                error.0
-            ));
+        let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if inserted >= inputs.len() {
+            return;
+        }
+        // SAFETY: GetLastError has no preconditions.
+        let error = unsafe { GetLastError() };
+        let reason = format!("SendInput inserted {inserted} of {} events, error {}", inputs.len(), error.0);
+        let missed = &replays[inserted..];
+        let key_ups: Vec<INPUT> = missed
+            .iter()
+            .filter(|replay| matches!(replay, Replay::Key(key) if key.up && !key.is_mask()))
+            .map(|replay| replay_input(replay, &screen, swapped))
+            .collect();
+        if !key_ups.is_empty() {
+            // SAFETY: as above.
+            let again = unsafe { SendInput(&key_ups, std::mem::size_of::<INPUT>() as i32) } as usize;
+            if again < key_ups.len() {
+                let lost = key_ups.len() - again;
+                self.log.write(
+                    LogLevel::Warn,
+                    format!("{lost} key releases could not be replayed either; a modifier may stay down."),
+                );
+            }
+        }
+        if missed.iter().any(|replay| matches!(replay, Replay::Mouse(_))) {
+            self.logic.replay_failed(reason);
+        } else {
+            self.log.write(LogLevel::Warn, format!("Key replay failed ({reason}); click holding stays on."));
         }
     }
 
@@ -768,6 +831,33 @@ impl TargetProbe {
         }
     }
 
+    /// Called from the keyboard hook, like [`Self::may_hold_at`]: whether keys
+    /// replayed now reach the foreground window (see `may_queue_keys_for`).
+    fn foreground_accepts_keys(&mut self, now_ms: u64) -> bool {
+        // SAFETY: no preconditions.
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        // SAFETY: `pid` is a valid out pointer.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let integrity = if pid == 0 || pid == self.own_pid { None } else { self.integrity_of(pid, now_ms) };
+        may_queue_keys_for(pid, integrity, self.own_pid, self.own_integrity)
+    }
+
+    /// Integrity level of `pid`, from the short-lived cache when possible.
+    fn integrity_of(&mut self, pid: u32, now_ms: u64) -> Option<u32> {
+        match self.cache.get(pid, now_ms) {
+            Some(level) => level,
+            None => {
+                let level = process_integrity(pid);
+                self.cache.insert(pid, level, now_ms);
+                level
+            }
+        }
+    }
+
     /// Called from the mouse hook: only calls that read window-manager and
     /// process state, none of which send messages or wait on other threads.
     fn may_hold_at(&mut self, point: PointPx, now_ms: u64) -> bool {
@@ -785,18 +875,8 @@ impl TargetProbe {
             let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
             !root.is_invalid() && root != hwnd && is_tedcat_class(root)
         };
-        let integrity = if pid == 0 || pid == self.own_pid || tedcat_class {
-            None
-        } else {
-            match self.cache.get(pid, now_ms) {
-                Some(level) => level,
-                None => {
-                    let level = process_integrity(pid);
-                    self.cache.insert(pid, level, now_ms);
-                    level
-                }
-            }
-        };
+        let integrity =
+            if pid == 0 || pid == self.own_pid || tedcat_class { None } else { self.integrity_of(pid, now_ms) };
         may_hold_over(pid, tedcat_class, integrity, self.own_pid, self.own_integrity)
     }
 }
@@ -907,13 +987,23 @@ fn other_action(message: u32, mouse_data: u32) -> Option<ReplayAction> {
 }
 
 /// `MOUSEEVENTF_*` button flags and `mouseData` for an action.
-fn action_flags(action: ReplayAction) -> (MOUSE_EVENT_FLAGS, u32) {
+///
+/// `action` names logical buttons (primary = "left"), as the hook reports
+/// them; the flags name physical buttons, which Windows swaps again when
+/// `swapped` (`SM_SWAPBUTTON`, "primary button = right"). So with swapped
+/// buttons the primary button is injected as the physical right one.
+fn action_flags(action: ReplayAction, swapped: bool) -> (MOUSE_EVENT_FLAGS, u32) {
+    let (primary_down, primary_up, secondary_down, secondary_up) = if swapped {
+        (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+    } else {
+        (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+    };
     match action {
         ReplayAction::Move => (MOUSE_EVENT_FLAGS(0), 0),
-        ReplayAction::LeftDown => (MOUSEEVENTF_LEFTDOWN, 0),
-        ReplayAction::LeftUp => (MOUSEEVENTF_LEFTUP, 0),
-        ReplayAction::RightDown => (MOUSEEVENTF_RIGHTDOWN, 0),
-        ReplayAction::RightUp => (MOUSEEVENTF_RIGHTUP, 0),
+        ReplayAction::LeftDown => (primary_down, 0),
+        ReplayAction::LeftUp => (primary_up, 0),
+        ReplayAction::RightDown => (secondary_down, 0),
+        ReplayAction::RightUp => (secondary_up, 0),
         ReplayAction::MiddleDown => (MOUSEEVENTF_MIDDLEDOWN, 0),
         ReplayAction::MiddleUp => (MOUSEEVENTF_MIDDLEUP, 0),
         ReplayAction::XDown(button) => (MOUSEEVENTF_XDOWN, u32::from(button)),
@@ -946,10 +1036,42 @@ impl VirtualScreen {
     }
 }
 
+/// The marked `SendInput` event for one replay.
+fn replay_input(replay: &Replay, screen: &VirtualScreen, swapped: bool) -> INPUT {
+    match replay {
+        Replay::Mouse(event) => mouse_input(event, screen, swapped),
+        Replay::Key(key) => key_input(key),
+    }
+}
+
+/// One marked keyboard event: the virtual key and scan code as the hook saw
+/// them, extended when the original was.
+fn key_input(key: &KeyStroke) -> INPUT {
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if key.up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    if key.extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(key.vk),
+                wScan: key.scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: TEDCAT_INPUT_MARKER,
+            },
+        },
+    }
+}
+
 /// One marked, absolute `SendInput` event. Every event carries `MOUSEEVENTF_MOVE`
-/// so it happens at its own point.
-fn mouse_input(event: &ReplayEvent, screen: &VirtualScreen) -> INPUT {
-    let (buttons, data) = action_flags(event.action);
+/// so it happens at its own point. `swapped`: see [`action_flags`].
+fn mouse_input(event: &ReplayEvent, screen: &VirtualScreen, swapped: bool) -> INPUT {
+    let (buttons, data) = action_flags(event.action, swapped);
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -1033,7 +1155,7 @@ mod tests {
     #[test]
     fn replays_are_absolute_marked_and_carry_wheel_data() {
         let screen = VirtualScreen { left: -1920, top: 0, width: 3840, height: 1080 };
-        let input = mouse_input(&ReplayEvent::new(PointPx::new(-1920, 0), ReplayAction::LeftDown), &screen);
+        let input = mouse_input(&ReplayEvent::new(PointPx::new(-1920, 0), ReplayAction::LeftDown), &screen, false);
         assert_eq!(input.r#type, INPUT_MOUSE);
         // SAFETY: the union was initialized as `mi`.
         let mi = unsafe { input.Anonymous.mi };
@@ -1044,10 +1166,64 @@ mod tests {
         );
         assert!(mi.dx < 20 && mi.dy < 40);
 
-        let wheel = mouse_input(&ReplayEvent::new(PointPx::new(0, 0), ReplayAction::Wheel(-120)), &screen);
+        let wheel = mouse_input(&ReplayEvent::new(PointPx::new(0, 0), ReplayAction::Wheel(-120)), &screen, false);
         // SAFETY: as above.
         let mi = unsafe { wheel.Anonymous.mi };
         assert_eq!(mi.mouseData as i32, -120);
         assert!(mi.dwFlags.contains(MOUSEEVENTF_WHEEL));
+    }
+
+    #[test]
+    fn swapped_buttons_inject_the_physical_button_of_the_logical_one() {
+        use ReplayAction::*;
+        let plain = [
+            (LeftDown, MOUSEEVENTF_LEFTDOWN),
+            (LeftUp, MOUSEEVENTF_LEFTUP),
+            (RightDown, MOUSEEVENTF_RIGHTDOWN),
+            (RightUp, MOUSEEVENTF_RIGHTUP),
+        ];
+        for (action, flags) in plain {
+            assert_eq!(action_flags(action, false), (flags, 0), "{action:?}");
+        }
+        let swapped = [
+            (LeftDown, MOUSEEVENTF_RIGHTDOWN),
+            (LeftUp, MOUSEEVENTF_RIGHTUP),
+            (RightDown, MOUSEEVENTF_LEFTDOWN),
+            (RightUp, MOUSEEVENTF_LEFTUP),
+        ];
+        for (action, flags) in swapped {
+            assert_eq!(action_flags(action, true), (flags, 0), "{action:?}");
+        }
+        // Middle, X buttons, wheels and moves are never swapped.
+        for action in [Move, MiddleDown, MiddleUp, XDown(1), XUp(2), Wheel(120), HWheel(-120)] {
+            assert_eq!(action_flags(action, true), action_flags(action, false), "{action:?}");
+        }
+        assert_eq!(action_flags(XUp(2), true), (MOUSEEVENTF_XUP, 2));
+
+        let screen = VirtualScreen { left: 0, top: 0, width: 1024, height: 768 };
+        let input = mouse_input(&ReplayEvent::new(PointPx::new(10, 10), LeftUp), &screen, true);
+        // SAFETY: the union was initialized as `mi`.
+        let mi = unsafe { input.Anonymous.mi };
+        assert_eq!(mi.dwFlags, MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+    }
+
+    #[test]
+    fn replayed_keys_are_marked_and_keep_their_flags() {
+        let right_ctrl_up = KeyStroke { vk: 0xA3, scan: 0x1D, extended: true, up: true };
+        let screen = VirtualScreen { left: 0, top: 0, width: 1024, height: 768 };
+        let input = replay_input(&Replay::Key(right_ctrl_up), &screen, false);
+        assert_eq!(input.r#type, INPUT_KEYBOARD);
+        // SAFETY: the union was initialized as `ki`.
+        let ki = unsafe { input.Anonymous.ki };
+        assert_eq!(ki.wVk, VIRTUAL_KEY(0xA3));
+        assert_eq!(ki.wScan, 0x1D);
+        assert_eq!(ki.dwFlags, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY);
+        assert_eq!(ki.dwExtraInfo, TEDCAT_INPUT_MARKER);
+
+        // SAFETY: as above.
+        let mask = unsafe { key_input(&KeyStroke::mask(false)).Anonymous.ki };
+        assert_eq!(mask.wVk, VIRTUAL_KEY(0xE8));
+        assert_eq!(mask.dwFlags, KEYBD_EVENT_FLAGS(0));
+        assert_eq!(mask.dwExtraInfo, TEDCAT_INPUT_MARKER);
     }
 }

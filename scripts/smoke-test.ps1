@@ -2289,6 +2289,515 @@ namespace TedCatSmokeUiFix
         Assert $end.Ok "WM_ENDSESSION failed ($end)"
         Assert-UiFixMp4Complete $path 'when WM_ENDSESSION returned during the quit'
     }
+
+    # -----------------------------------------------------------------------
+    # Input hook: swapped mouse buttons, modifier keys kept in order with a
+    # held press, and the menu mask key after Alt/Win + hold
+    # (crates/app/src/input/hook.rs, hook/logic.rs).
+    #
+    # Self-contained: its own probe window (a TopMost form with no child
+    # controls, so it takes keyboard focus itself and logs every button and
+    # key message it gets, with MK_* flags and the GetMessageExtraInfo tag),
+    # its own TedCat runs with the trigger each check needs, and every change
+    # is undone in a finally block: the button swap, keys or buttons left
+    # down, the settings file, TedCat (stopped again) and the probe (closed).
+
+    $hookProbeSource = @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace TedCatHookSmoke
+{
+    public static class N
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)]
+        public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct INPUT { public uint type; public InputUnion u; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint SendInput(uint count, [In, MarshalAs(UnmanagedType.LPArray)] INPUT[] inputs, int size);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+        [DllImport("user32.dll")] public static extern bool SwapMouseButton(bool swap);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")] public static extern IntPtr GetMessageExtraInfo();
+    }
+
+    /// Injected input with dwExtraInfo 0 (TedCat treats it as real input).
+    /// The MOUSEEVENTF_* button flags are physical buttons.
+    public static class Send
+    {
+        public const uint LeftDown = 0x0002, LeftUp = 0x0004, RightDown = 0x0008, RightUp = 0x0010;
+        public static string LastError = "";
+
+        static int Normalize(int value, int origin, int extent)
+        {
+            if (extent <= 1) return 0;
+            long offset = Math.Max(0L, Math.Min((long)extent - 1, (long)value - origin));
+            return (int)Math.Min(65535L, (offset * 65536 + 32768) / extent);
+        }
+
+        static N.INPUT Mouse(int x, int y, uint buttons)
+        {
+            N.INPUT input = new N.INPUT();
+            input.type = 0;
+            input.u.mi.dx = Normalize(x, N.GetSystemMetrics(76), N.GetSystemMetrics(78));
+            input.u.mi.dy = Normalize(y, N.GetSystemMetrics(77), N.GetSystemMetrics(79));
+            // MOVE | ABSOLUTE | VIRTUALDESK, plus the button flags.
+            input.u.mi.dwFlags = buttons | 0x0001 | 0x8000 | 0x4000;
+            input.u.mi.dwExtraInfo = IntPtr.Zero;
+            return input;
+        }
+
+        static bool One(N.INPUT input)
+        {
+            N.INPUT[] inputs = new N.INPUT[] { input };
+            uint inserted = N.SendInput(1, inputs, Marshal.SizeOf(typeof(N.INPUT)));
+            if (inserted != 1)
+            {
+                LastError = "SendInput inserted " + inserted + " of 1 events, error " + Marshal.GetLastWin32Error();
+                return false;
+            }
+            return true;
+        }
+
+        static bool Pause(int ms) { if (ms > 0) Thread.Sleep(ms); return true; }
+
+        public static bool Move(int x, int y) { return One(Mouse(x, y, 0)); }
+        public static bool Button(int x, int y, uint flags) { return One(Mouse(x, y, flags)); }
+
+        public static bool Key(ushort vk, ushort scan, bool up, bool extended)
+        {
+            N.INPUT input = new N.INPUT();
+            input.type = 1;
+            input.u.ki.wVk = vk;
+            input.u.ki.wScan = scan;
+            input.u.ki.dwFlags = (up ? 0x0002u : 0u) | (extended ? 0x0001u : 0u);
+            input.u.ki.dwExtraInfo = IntPtr.Zero;
+            return One(input);
+        }
+
+        /// Move there, press with `down`, wait holdMs, release with `up`.
+        public static bool Click(int x, int y, uint down, uint up, int holdMs)
+        {
+            return Move(x, y) && Pause(40) && Button(x, y, down) && Pause(holdMs) && Button(x, y, up);
+        }
+
+        /// Press at (x1, y1) and move straight away in `steps` steps to (x2, y2), then release.
+        public static bool Drag(int x1, int y1, int x2, int y2, uint down, uint up, int steps, int stepMs)
+        {
+            if (!(Move(x1, y1) && Pause(60) && Button(x1, y1, down))) return false;
+            for (int i = 1; i <= steps; i++)
+            {
+                if (!(Move(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps) && Pause(stepMs))) return false;
+            }
+            return Pause(60) && Button(x2, y2, up);
+        }
+    }
+
+    /// Logs "KIND detail TAG": button messages with "mk=<wParam MK_* flags>",
+    /// key messages with "vk=<virtual key>", WM_SYSCOMMAND with "sc=..", and
+    /// WM_ENTERMENULOOP. TAG is "TCAT" for TedCat's replays.
+    public class ProbeForm : Form
+    {
+        static string Kind(int msg)
+        {
+            switch (msg)
+            {
+                case 0x100: return "KEYDOWN";
+                case 0x101: return "KEYUP";
+                case 0x104: return "SYSKEYDOWN";
+                case 0x105: return "SYSKEYUP";
+                case 0x201: return "LDOWN";
+                case 0x202: return "LUP";
+                case 0x203: return "LDBL";
+                case 0x204: return "RDOWN";
+                case 0x205: return "RUP";
+                case 0x206: return "RDBL";
+            }
+            return null;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            int msg = m.Msg;
+            long wp = m.WParam.ToInt64();
+            string kind = Kind(msg);
+            if (kind != null && msg >= 0x201) Probe.Log(kind, "mk=" + (wp & 0xFFFF).ToString("X"), N.GetMessageExtraInfo());
+            else if (kind != null) Probe.Log(kind, "vk=" + (wp & 0xFF).ToString("X2"), N.GetMessageExtraInfo());
+            else if (msg == 0x112) Probe.Log("SYSCOMMAND", "sc=" + (wp & 0xFFF0).ToString("X4"), IntPtr.Zero);
+            else if (msg == 0x211) Probe.Log("ENTERMENULOOP", "-", IntPtr.Zero);
+            base.WndProc(ref m);
+        }
+    }
+
+    public static class Probe
+    {
+        static readonly object Gate = new object();
+        static readonly List<string> events = new List<string>();
+        public static ProbeForm Form;
+        public static IntPtr Handle = IntPtr.Zero;
+        public const long TedCatMarker = 0x54434154;
+
+        public static void Log(string kind, string detail, IntPtr extraInfo)
+        {
+            long extra = extraInfo.ToInt64();
+            string tag = extra == TedCatMarker ? "TCAT" : "0x" + extra.ToString("X");
+            lock (Gate) events.Add(kind + " " + detail + " " + tag);
+        }
+
+        public static string[] Events() { lock (Gate) return events.ToArray(); }
+        public static void Clear() { lock (Gate) events.Clear(); }
+
+        /// Shows the probe on its own STA thread; returns null or the error.
+        public static string Start(int x, int y, int width, int height)
+        {
+            if (Handle != IntPtr.Zero) return null;
+            ManualResetEvent ready = new ManualResetEvent(false);
+            string error = null;
+            Rectangle bounds = new Rectangle(x, y, width, height);
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    ProbeForm form = new ProbeForm();
+                    form.Text = "TedCat input hook probe";
+                    form.StartPosition = FormStartPosition.Manual;
+                    form.FormBorderStyle = FormBorderStyle.FixedSingle;
+                    form.MaximizeBox = false;
+                    form.MinimizeBox = false;
+                    form.TopMost = true;
+                    form.Bounds = bounds;
+                    form.BackColor = Color.LightYellow;
+                    form.Shown += delegate { Form = form; Handle = form.Handle; ready.Set(); };
+                    Application.Run(form);
+                }
+                catch (Exception e)
+                {
+                    error = e.ToString();
+                    ready.Set();
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.IsBackground = true;
+            thread.Start();
+            if (!ready.WaitOne(20000)) return "the probe window did not appear within 20 s";
+            Thread.Sleep(300);
+            return error;
+        }
+
+        /// Screen coordinates of the centre of the probe's client area.
+        public static int[] ClientCenter()
+        {
+            ProbeForm form = Form;
+            return (int[])form.Invoke(new Func<int[]>(delegate
+            {
+                Rectangle r = form.RectangleToScreen(form.ClientRectangle);
+                return new int[] { r.Left + r.Width / 2, r.Top + r.Height / 2 };
+            }));
+        }
+
+        public static bool UnderPoint(int x, int y)
+        {
+            N.POINT p; p.X = x; p.Y = y;
+            IntPtr hwnd = N.WindowFromPoint(p);
+            // GA_ROOT = 2
+            return hwnd != IntPtr.Zero && (hwnd == Handle || N.GetAncestor(hwnd, 2) == Handle);
+        }
+
+        public static bool IsForeground() { return Handle != IntPtr.Zero && N.GetForegroundWindow() == Handle; }
+
+        public static bool Activate()
+        {
+            ProbeForm form = Form;
+            return (bool)form.Invoke(new Func<bool>(delegate { form.Activate(); return N.SetForegroundWindow(form.Handle); }));
+        }
+
+        public static bool IsDown(int vk) { return (N.GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+        public static void Close()
+        {
+            ProbeForm form = Form;
+            Form = null;
+            Handle = IntPtr.Zero;
+            if (form == null) return;
+            try { form.Invoke(new Action(delegate { form.Close(); })); } catch (Exception) { }
+        }
+    }
+}
+'@
+
+    # Shows the probe window (compiling its helpers on first use) and returns
+    # the centre of its client area.
+    function Initialize-HookProbe {
+        if (-not ('TedCatHookSmoke.Probe' -as [type])) {
+            Add-Type -TypeDefinition $hookProbeSource -ReferencedAssemblies System.Windows.Forms, System.Drawing -Language CSharp
+        }
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $err = [TedCatHookSmoke.Probe]::Start($wa.X + 200, $wa.Y + 200, 480, 320)
+        if ($err) { throw "the probe window failed: $err" }
+        $c = [TedCatHookSmoke.Probe]::ClientCenter()
+        if (-not [TedCatHookSmoke.Probe]::UnderPoint($c[0], $c[1])) {
+            throw "the probe window is not under its own centre $($c[0]),$($c[1]): $([TedCatSmoke.Win]::WindowAt($c[0], $c[1]))"
+        }
+        return $c
+    }
+
+    function Invoke-ProbeInput([bool]$Ok, [string]$What) {
+        if (-not $Ok) { throw "SendInput failed during ${What}: $([TedCatHookSmoke.Send]::LastError)" }
+    }
+
+    # (Re)starts TedCat with the given trigger ("HoldOnly", "Control", "Alt", "Win").
+    function Start-HookTedCat([string]$Trigger) {
+        if ($script:Ted -and -not $script:Ted.HasExited) {
+            Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+            [void]$script:Ted.WaitForExit(10000)
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path $SettingsPath) | Out-Null
+        [System.IO.File]::WriteAllText($SettingsPath, ('{{"enabled":true,"trigger":"{0}","hold_millis":350,"play_sounds":false,"include_system_audio":true,"recordings_folder":null}}' -f $Trigger))
+        $mark = Get-LogMark
+        $script:Ted = Start-TedCat
+        $line = Wait-Log 'input hook status: (Active|Unavailable.*)' $mark 15000
+        Assert ($null -ne $line -and $line -match 'Active') "TedCat with trigger $Trigger did not report an active input hook (log: $line)"
+        Note "TedCat pid $($script:Ted.Id) running with trigger $Trigger"
+    }
+
+    # Undoes everything a hook step may have left: TedCat stopped again (as
+    # the steps before left it), default settings, probe closed.
+    function Stop-HookTedCat {
+        if ($script:Ted -and -not $script:Ted.HasExited) {
+            Stop-Process -Id $script:Ted.Id -Force -ErrorAction SilentlyContinue
+            [void]$script:Ted.WaitForExit(10000)
+        }
+        Write-Settings
+        if ('TedCatHookSmoke.Probe' -as [type]) { [TedCatHookSmoke.Probe]::Close() }
+    }
+
+    # The probe's button and key messages in order, as tokens such as
+    # "LDOWN+C:TCAT" (+C = MK_CONTROL, +S = MK_SHIFT in wParam) or
+    # "KEYUP(11):0x0" (only for the generic virtual keys in $Keys). TCAT
+    # marks TedCat's replays, 0x0 events that came straight from this script.
+    function Get-ProbeOrder([int[]]$Keys) {
+        $tokens = foreach ($e in [TedCatHookSmoke.Probe]::Events()) {
+            $f = $e -split ' '
+            if ($f[1].StartsWith('mk=')) {
+                $mk = [Convert]::ToInt32($f[1].Substring(3), 16)
+                $mods = ''
+                if ($mk -band 0x8) { $mods += '+C' }
+                if ($mk -band 0x4) { $mods += '+S' }
+                '{0}{1}:{2}' -f $f[0], $mods, $f[2]
+            } elseif ($f[1].StartsWith('vk=')) {
+                $vk = [Convert]::ToInt32($f[1].Substring(3), 16)
+                # Left/right-specific Shift, Ctrl, Alt (VK_LSHIFT..VK_RMENU) as their generic keys.
+                if ($vk -ge 0xA0 -and $vk -le 0xA5) { $vk = 0x10 + [int][Math]::Floor(($vk - 0xA0) / 2) }
+                if ($Keys -contains $vk) { '{0}({1:X2}):{2}' -f $f[0], $vk, $f[2] }
+            }
+        }
+        return (@($tokens) -join ' ')
+    }
+
+    function Get-ProbeMenuEvents {
+        return @([TedCatHookSmoke.Probe]::Events() | Where-Object { $_ -match '^ENTERMENULOOP|^SYSCOMMAND sc=F100' })
+    }
+
+    # Clicks the probe (and asks for it) until it is the foreground window,
+    # so it receives the keyboard messages.
+    function Set-ProbeForeground([int[]]$C) {
+        if (-not [TedCatHookSmoke.Probe]::IsForeground()) {
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Click($C[0], $C[1], [TedCatHookSmoke.Send]::LeftDown, [TedCatHookSmoke.Send]::LeftUp, 40)) 'the activating click'
+            [void](Wait-Until { [TedCatHookSmoke.Probe]::IsForeground() } 1500)
+        }
+        if (-not [TedCatHookSmoke.Probe]::IsForeground()) {
+            [void][TedCatHookSmoke.Probe]::Activate()
+            [void](Wait-Until { [TedCatHookSmoke.Probe]::IsForeground() } 1500)
+        }
+        Assert ([TedCatHookSmoke.Probe]::IsForeground()) "the probe window could not be made the foreground window (foreground: $([TedCatSmoke.Win]::Foreground()))"
+        # Keeps the next click from pairing with the activating one into a double click.
+        Start-Sleep -Milliseconds 700
+    }
+
+    # Virtual keys / mouse buttons still down, e.g. "VK_CONTROL,VK_LBUTTON", or "none".
+    function Get-DownKeys {
+        $names = @{ 0x01 = 'VK_LBUTTON'; 0x02 = 'VK_RBUTTON'; 0x10 = 'VK_SHIFT'; 0x11 = 'VK_CONTROL'; 0x12 = 'VK_MENU'; 0x5B = 'VK_LWIN' }
+        $down = @($names.Keys | Sort-Object | Where-Object { [TedCatHookSmoke.Probe]::IsDown($_) } | ForEach-Object { $names[$_] })
+        if ($down.Count) { return ($down -join ',') }
+        return 'none'
+    }
+
+    # Releases whatever Get-DownKeys reports, so a failed check never leaves
+    # a key or button down for the steps after it.
+    function Clear-DownKeys([int[]]$At) {
+        $keys = @(@(0x10, 0x2A, $false), @(0x11, 0x1D, $false), @(0x12, 0x38, $false), @(0x5B, 0x5B, $true))
+        foreach ($k in $keys) {
+            if ([TedCatHookSmoke.Probe]::IsDown($k[0])) { [void][TedCatHookSmoke.Send]::Key($k[0], $k[1], $true, $k[2]) }
+        }
+        if ([TedCatHookSmoke.Probe]::IsDown(0x01) -or [TedCatHookSmoke.Probe]::IsDown(0x02)) {
+            # GetAsyncKeyState reports physical buttons; release both to be sure.
+            [void][TedCatHookSmoke.Send]::Button($At[0], $At[1], [TedCatHookSmoke.Send]::LeftUp)
+            [void][TedCatHookSmoke.Send]::Button($At[0], $At[1], [TedCatHookSmoke.Send]::RightUp)
+        }
+    }
+
+    # SwapMouseButton(true) ("primary button = right", the usual left-handed
+    # setting). The hook sees logical buttons, SendInput takes physical ones:
+    # TedCat's replays must convert, or a quick primary click turns into a
+    # right-click and a drag leaves a button stuck down.
+    Invoke-Step 'hook-swapped-buttons' {
+        $c = $null
+        $wasSwapped = $false
+        $swappedNow = $false
+        try {
+            $c = Initialize-HookProbe
+            Start-HookTedCat 'HoldOnly'
+            $wasSwapped = [TedCatHookSmoke.N]::SwapMouseButton($true)
+            $swappedNow = $true
+            $metric = [TedCatHookSmoke.N]::GetSystemMetrics(23)
+            Note "SwapMouseButton(true): SM_SWAPBUTTON is now $metric (swapped before: $wasSwapped)"
+            Assert ($metric -ne 0) 'SwapMouseButton(true) did not swap the buttons'
+
+            # The primary button is now the physical right one.
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Click($c[0], $c[1], [TedCatHookSmoke.Send]::RightDown, [TedCatHookSmoke.Send]::RightUp, 40)) 'the quick primary click'
+            Start-Sleep -Milliseconds 700
+            $click = Get-ProbeOrder @()
+            Note "quick primary click (physical right button): probe got '$click'"
+            Assert ($click -eq 'LDOWN:TCAT LUP:TCAT') "with swapped buttons a quick primary click must arrive as TedCat's replayed primary press and release (LDOWN:TCAT LUP:TCAT), got '$click'"
+
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Drag($c[0] - 120, $c[1], $c[0] + 80, $c[1], [TedCatHookSmoke.Send]::RightDown, [TedCatHookSmoke.Send]::RightUp, 10, 10)) 'the quick primary drag'
+            Start-Sleep -Milliseconds 500
+            $drag = Get-ProbeOrder @()
+            $down = Get-DownKeys
+            Note "quick primary drag: probe got '$drag'; buttons down afterwards: $down"
+            Assert ($drag -eq 'LDOWN:TCAT LUP:0x0') "with swapped buttons a drag must be TedCat's replayed primary press, then the real release (LDOWN:TCAT LUP:0x0), got '$drag'"
+            Assert ($down -eq 'none') "a mouse button stayed down after the drag: $down"
+            Assert-TedRunning
+        } finally {
+            if ($c) { Clear-DownKeys $c }
+            if ($swappedNow) { [void][TedCatHookSmoke.N]::SwapMouseButton($wasSwapped) }
+            Note "buttons restored: SM_SWAPBUTTON $([TedCatHookSmoke.N]::GetSystemMetrics(23))"
+            Stop-HookTedCat
+        }
+    }
+
+    # A modifier pressed or released while TedCat holds the press must reach
+    # the app in its physical place: the click's MK_CONTROL / MK_SHIFT come
+    # from the key state at that point of the input stream.
+    Invoke-Step 'hook-modifier-order' {
+        $c = $null
+        try {
+            $c = Initialize-HookProbe
+            Start-HookTedCat 'HoldOnly'
+            Set-ProbeForeground $c
+            $left = [TedCatHookSmoke.Send]::LeftDown; $leftUp = [TedCatHookSmoke.Send]::LeftUp
+
+            # Ctrl held at the press and let go before the release: a Ctrl+click.
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Move($c[0], $c[1])) 'the move'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x11, 0x1D, $false, $false)) 'Ctrl down'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $left)) 'the press'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x11, 0x1D, $true, $false)) 'Ctrl up'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $leftUp)) 'the release'
+            Start-Sleep -Milliseconds 700
+            $ctrl = Get-ProbeOrder @(0x11)
+            Note "Ctrl down, press, Ctrl up, release: probe got '$ctrl'"
+            Assert ($ctrl -eq 'KEYDOWN(11):0x0 LDOWN+C:TCAT KEYUP(11):TCAT LUP:TCAT') "the held press must be replayed with Ctrl still down and the Ctrl release replayed after it (expected 'KEYDOWN(11):0x0 LDOWN+C:TCAT KEYUP(11):TCAT LUP:TCAT'), got '$ctrl'"
+
+            # Shift pressed only after the press: not part of the press.
+            [TedCatHookSmoke.Probe]::Clear()
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $left)) 'the press'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $false, $false)) 'Shift down'
+            Start-Sleep -Milliseconds 60
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Button($c[0], $c[1], $leftUp)) 'the release'
+            Start-Sleep -Milliseconds 40
+            Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key(0x10, 0x2A, $true, $false)) 'Shift up'
+            Start-Sleep -Milliseconds 700
+            $shift = Get-ProbeOrder @(0x10)
+            Note "press, Shift down, release, Shift up: probe got '$shift'"
+            Assert ($shift -eq 'LDOWN:TCAT KEYDOWN(10):TCAT LUP+S:TCAT KEYUP(10):0x0') "the held press must be replayed before the Shift press (expected 'LDOWN:TCAT KEYDOWN(10):TCAT LUP+S:TCAT KEYUP(10):0x0'), got '$shift'"
+
+            $down = Get-DownKeys
+            Note "keys down afterwards: $down"
+            Assert ($down -eq 'none') "keys stayed down after the modifier clicks: $down"
+            Assert-TedRunning
+        } finally {
+            if ($c) { Clear-DownKeys $c }
+            Stop-HookTedCat
+        }
+    }
+
+    # Alt + hold and Win + hold swallow the press and the release, so the
+    # app would see a lone Alt or Win tap (menu bar / Start menu). TedCat
+    # injects the unassigned key 0xE8 while the modifier is down to prevent it.
+    Invoke-Step 'hook-menu-key-mask' {
+        $c = $null
+        $cases = @(
+            @{ Trigger = 'Alt'; Vk = 0x12; Scan = 0x38; Extended = $false },
+            @{ Trigger = 'Win'; Vk = 0x5B; Scan = 0x5B; Extended = $true }
+        )
+        try {
+            $c = Initialize-HookProbe
+            foreach ($case in $cases) {
+                Start-HookTedCat $case.Trigger
+                Set-ProbeForeground $c
+                [TedCatHookSmoke.Probe]::Clear()
+                $mark = Get-LogMark
+                Invoke-ProbeInput ([TedCatHookSmoke.Send]::Key($case.Vk, $case.Scan, $false, $case.Extended)) "$($case.Trigger) down"
+                try {
+                    Start-Sleep -Milliseconds 60
+                    Invoke-HoldDrag ($c[0] - 100) ($c[1] - 60) ($c[0] + 60) ($c[1] + 60) 600
+                    Start-Sleep -Milliseconds 80
+                } finally {
+                    [void][TedCatHookSmoke.Send]::Key($case.Vk, $case.Scan, $true, $case.Extended)
+                }
+                Start-Sleep -Milliseconds 1000
+                $shot = Wait-Log 'screenshot \d+x\d+ copied|screenshot failed.*' $mark 3000
+                $order = Get-ProbeOrder @($case.Vk, 0xE8)
+                $menu = @(Get-ProbeMenuEvents)
+                $foreground = [TedCatHookSmoke.Probe]::IsForeground()
+                $foregroundName = [TedCatSmoke.Win]::Foreground()
+                $buttons = Get-ProbeOrder @()
+                Note ("{0} + hold + drag: log '{1}'; probe keys '{2}'; menu activation [{3}]; probe still foreground: {4} ({5})" -f $case.Trigger, $shot, $order, ($menu -join '; '), $foreground, $foregroundName)
+                if ($menu.Count -or -not $foreground) {
+                    # Leave menu mode or close the Start menu before anything else runs.
+                    [void][TedCatHookSmoke.Send]::Key(0x1B, 0x01, $false, $false)
+                    Start-Sleep -Milliseconds 30
+                    [void][TedCatHookSmoke.Send]::Key(0x1B, 0x01, $true, $false)
+                    Start-Sleep -Milliseconds 500
+                }
+                Assert ($null -ne $shot -and $shot -match 'copied') "the $($case.Trigger) + hold gesture did not take a screenshot (log: $shot)"
+                Assert ($buttons -notmatch 'DOWN') "the $($case.Trigger) + hold press reached the probe: '$buttons'"
+                $vk = '{0:X2}' -f $case.Vk
+                $expected = "^(SYS)?KEYDOWN\($vk\):0x0 (SYS)?KEYDOWN\(E8\):TCAT (SYS)?KEYUP\(E8\):TCAT (SYS)?KEYUP\($vk\):0x0$"
+                Assert ($order -match $expected) "TedCat must inject the mask key 0xE8 while $($case.Trigger) is down (expected $expected), got '$order'"
+                Assert ($menu.Count -eq 0) "the lone $($case.Trigger) tap activated the menu: $($menu -join '; ')"
+                Assert $foreground "the probe lost the foreground after the $($case.Trigger) tap (now $foregroundName): Start menu?"
+                Assert-TedRunning
+            }
+        } finally {
+            if ($c) { Clear-DownKeys $c }
+            Stop-HookTedCat
+        }
+    }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
     $script:Results.Add([pscustomobject]@{ Step = 'script'; Result = 'failed'; Evidence = $_.Exception.Message })
