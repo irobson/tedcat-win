@@ -110,6 +110,9 @@ enum Scaling {
 
 /// Scales the cropped region to the encoded size with the D3D11 video processor.
 struct GpuScaler {
+    /// The immediate context's critical section, held for each frame's whole
+    /// clear / copy / blit / read-back sequence (see `DeviceSection`).
+    lock: Option<ID3D11Multithread>,
     video_context: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
     /// The region at its source size: the crop lands here.
@@ -450,6 +453,7 @@ impl Gpu {
                 })
             }
             Scaling::Gpu(scaler) => {
+                let _section = scaler.lock.as_ref().map(DeviceSection::enter);
                 scaler.scale(&self.context, frame, copy, source)?;
                 // SAFETY: the output and staging textures are both `encoded` BGRA.
                 unsafe { self.context.CopyResource(&self.staging, &scaler.output) };
@@ -539,6 +543,7 @@ impl GpuScaler {
             video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
 
             let scaler = GpuScaler {
+                lock: context.cast::<ID3D11Multithread>().ok(),
                 video_context,
                 processor,
                 region,
@@ -590,6 +595,27 @@ impl GpuScaler {
         // Releases the reference the stream held.
         drop(ManuallyDrop::into_inner(stream.pInputSurface));
         result
+    }
+}
+
+/// Holds a device's multithread critical section until dropped. WGC uses the
+/// device from its own threads; holding the section keeps those calls from
+/// interleaving with a frame's video context work. The section is recursive,
+/// so the runtime's own per-call locking inside it is fine.
+struct DeviceSection<'a>(&'a ID3D11Multithread);
+
+impl<'a> DeviceSection<'a> {
+    fn enter(lock: &'a ID3D11Multithread) -> DeviceSection<'a> {
+        // SAFETY: balanced by Leave in Drop, on the same thread.
+        unsafe { lock.Enter() };
+        DeviceSection(lock)
+    }
+}
+
+impl Drop for DeviceSection<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard entered the section in `enter`.
+        unsafe { self.0.Leave() };
     }
 }
 
